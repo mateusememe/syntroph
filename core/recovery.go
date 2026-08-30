@@ -36,6 +36,16 @@ func InspectRecovery(ctx context.Context, journal *SagaJournal) ([]RecoveryItem,
 			return nil, err
 		}
 		item := RecoveryItem{SagaID: saga, State: "Succeeded", NextAction: "none"}
+		// A handler may be delivered more than once. Only the latest attempt
+		// for each handler represents its current obligation; the journal still
+		// retains every attempt for audit and recovery explanations.
+		latest := make(map[string]HandlerAttempt)
+		for _, record := range records {
+			if record.Attempt != nil {
+				item.Attempts = append(item.Attempts, *record.Attempt)
+				latest[record.Attempt.HandlerID] = *record.Attempt
+			}
+		}
 		for _, record := range records {
 			if record.Event != nil {
 				item.EventID, item.RepositoryID = record.Event.EventID, record.Event.RepositoryID
@@ -49,13 +59,12 @@ func InspectRecovery(ctx context.Context, journal *SagaJournal) ([]RecoveryItem,
 					}
 				}
 			}
-			if record.Attempt != nil {
-				item.Attempts = append(item.Attempts, *record.Attempt)
-				if record.Attempt.Outcome == "failed" {
-					item.State = "HandlerPending"
-					item.LastError = record.Attempt.Error
-					item.NextAction = "syntroph sync retry"
-				}
+		}
+		for _, attempt := range latest {
+			if attempt.Outcome == "failed" {
+				item.State = "HandlerPending"
+				item.LastError = attempt.Error
+				item.NextAction = "syntroph sync retry"
 			}
 		}
 		if item.State != "Succeeded" {
