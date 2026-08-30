@@ -134,20 +134,22 @@ type SessionCloseRequest struct {
 }
 
 type SessionDiary struct {
-	SessionID      string          `json:"session_id"`
-	IdempotencyKey string          `json:"idempotency_key"`
-	RepositoryID   string          `json:"repository_id"`
-	CommitSHA      string          `json:"commit_sha"`
-	ArtifactHash   string          `json:"artifact_hash"`
-	Author         string          `json:"author"`
-	Runtime        string          `json:"runtime,omitempty"`
-	CreatedAt      time.Time       `json:"created_at"`
-	Title          string          `json:"title"`
-	Summary        string          `json:"summary"`
-	Decisions      []string        `json:"decisions,omitempty"`
-	Lessons        []string        `json:"lessons,omitempty"`
-	CodeReferences []CodeReference `json:"code_references,omitempty"`
-	Related        []string        `json:"related,omitempty"`
+	SessionID       string          `json:"session_id"`
+	IdempotencyKey  string          `json:"idempotency_key"`
+	RepositoryID    string          `json:"repository_id"`
+	CommitSHA       string          `json:"commit_sha"`
+	ArtifactHash    string          `json:"artifact_hash"`
+	Author          string          `json:"author"`
+	Runtime         string          `json:"runtime,omitempty"`
+	CreatedAt       time.Time       `json:"created_at"`
+	Title           string          `json:"title"`
+	Summary         string          `json:"summary"`
+	Decisions       []string        `json:"decisions,omitempty"`
+	Lessons         []string        `json:"lessons,omitempty"`
+	CodeReferences  []CodeReference `json:"code_references,omitempty"`
+	Related         []string        `json:"related,omitempty"`
+	GraphSnapshotID string          `json:"graph_snapshot_id,omitempty"`
+	GraphState      string          `json:"graph_state,omitempty"`
 }
 
 type MemoryPort interface {
@@ -158,6 +160,7 @@ type MemoryPort interface {
 type SessionCloser struct {
 	Memory MemoryPort
 	Bus    *EventBus
+	Graph  GraphPort
 }
 
 func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (SessionDiary, Delivery, error) {
@@ -192,7 +195,26 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 		now = time.Now().UTC()
 	}
 	now = now.UTC()
-	diary := SessionDiary{SessionID: key[:24], IdempotencyKey: key, RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, ArtifactHash: artifactHash, Author: req.Author, Runtime: req.Runtime, CreatedAt: now, Title: a.Title, Summary: a.Summary, Decisions: a.Decisions, Lessons: a.Lessons, CodeReferences: a.CodeReferences, Related: a.Related}
+	refs := a.CodeReferences
+	graphState := GraphReady
+	var graphSnapshotID string
+	if c.Graph != nil {
+		resolution, graphErr := c.Graph.Resolve(ctx, GraphResolveRequest{RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, References: refs})
+		if graphErr != nil {
+			graphState = GraphResolutionPending
+			refs = unresolvedReferences(refs, req.RepositoryID, req.CommitSHA)
+		} else {
+			refs = resolution.References
+			graphSnapshotID = resolution.GraphSnapshotID
+			if publisher, ok := c.Graph.(GraphPublisher); ok {
+				_, publishErr := publisher.Publish(ctx, GraphSnapshot{RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, References: refs})
+				if publishErr != nil {
+					graphState = GraphSyncPending
+				}
+			}
+		}
+	}
+	diary := SessionDiary{SessionID: key[:24], IdempotencyKey: key, RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, ArtifactHash: artifactHash, Author: req.Author, Runtime: req.Runtime, CreatedAt: now, Title: a.Title, Summary: a.Summary, Decisions: a.Decisions, Lessons: a.Lessons, CodeReferences: refs, Related: a.Related, GraphSnapshotID: graphSnapshotID, GraphState: graphState}
 	if err := c.Memory.SaveDiary(ctx, diary); err != nil {
 		return SessionDiary{}, Delivery{}, err
 	}
@@ -203,6 +225,18 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 	e := Event{EventID: diary.SessionID, Type: "session.closed", OccurredAt: now, RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, SchemaVersion: 1, Payload: payload}
 	delivery, err := c.Bus.Publish(ctx, e)
 	return diary, delivery, err
+}
+
+func unresolvedReferences(refs []CodeReference, repositoryID, commitSHA string) []CodeReference {
+	out := make([]CodeReference, len(refs))
+	copy(out, refs)
+	for i := range out {
+		out[i].RepositoryID = repositoryID
+		out[i].CommitSHA = commitSHA
+		out[i].Confidence = ConfidenceUnresolved
+		out[i].GraphSnapshotID = ""
+	}
+	return out
 }
 
 // LocalMemoryStore is the canonical immutable .syntroph/memory store.
