@@ -32,7 +32,7 @@ cd path/to/your/repository
 syntroph init
 ```
 
-This creates `.syntroph/`, local memory and journal directories, templates, and baseline configuration. One installation manages one Git repository in the MVP.
+The `init` wizard is planned but not yet exposed by the current CLI. The current session-close command creates the required local state on first use. One installation manages one Git repository in the MVP.
 
 ## GitHub mirroring
 
@@ -44,4 +44,4 @@ storage:
     repository: owner/name
 ```
 
-Credentials are provided externally. Syntroph never stores or asks for GitHub tokens.
+Credentials are provided externally. Syntroph never stores or asks for GitHub tokens. The current release exposes the provider boundary and deterministic contract adapters; a concrete API/MCP client must be configured by the host integration.

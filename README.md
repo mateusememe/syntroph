@@ -27,8 +27,7 @@ See [CONTEXT.md](CONTEXT.md), [architecture decisions](docs/adr/), and [brainsto
 ## Usage (target CLI)
 
 ```sh
-syntroph init
-syntroph session close --artifact session.md
+syntroph session close --artifact session.md --repository owner/name --commit <sha>
 syntroph sync status
 syntroph sync recovery
 syntroph sync retry --graph
