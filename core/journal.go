@@ -143,6 +143,12 @@ func (j *SagaJournal) ReadSaga(ctx context.Context, sagaID string) ([]JournalRec
 		if err := json.Unmarshal(scanner.Bytes(), &r); err != nil {
 			return nil, fmt.Errorf("journal record: %w", err)
 		}
+		// Read-time migration keeps the append-only source untouched. Version
+		// zero is the immediately previous event schema used by early MVP
+		// journals; derive causal defaults from the immutable envelope.
+		if r.Event != nil {
+			migrateEvent(r.Event)
+		}
 		if r.Kind != "event" && r.Kind != "attempt" {
 			return nil, fmt.Errorf("journal record: unknown kind %q", r.Kind)
 		}
@@ -152,6 +158,18 @@ func (j *SagaJournal) ReadSaga(ctx context.Context, sagaID string) ([]JournalRec
 		return nil, err
 	}
 	return out, nil
+}
+
+func migrateEvent(e *Event) {
+	if e.SchemaVersion == 0 {
+		e.SchemaVersion = 1
+		if e.CorrelationID == "" {
+			e.CorrelationID = e.SagaID
+		}
+		if e.CausationID == "" {
+			e.CausationID = ""
+		}
+	}
 }
 
 func safeSegmentName(s string) string {

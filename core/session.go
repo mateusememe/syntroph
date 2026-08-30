@@ -157,10 +157,28 @@ type MemoryPort interface {
 	SaveDiary(context.Context, SessionDiary) error
 }
 
+// StoragePort mirrors the already durable diary to an external backend. The
+// port deliberately uses core-owned types so adapters cannot mutate domain
+// state or make the remote copy canonical.
+type StoragePort interface {
+	Mirror(context.Context, SessionDiary) StorageResult
+}
+
+type StorageResult struct {
+	State       string
+	Backend     string
+	Key         string
+	RemoteID    string
+	RemoteRev   string
+	ExpectedRev string
+	Cause       error
+}
+
 type SessionCloser struct {
-	Memory MemoryPort
-	Bus    *EventBus
-	Graph  GraphPort
+	Memory  MemoryPort
+	Bus     *EventBus
+	Graph   GraphPort
+	Storage StoragePort
 }
 
 func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (SessionDiary, Delivery, error) {
@@ -196,7 +214,7 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 	}
 	now = now.UTC()
 	refs := a.CodeReferences
-	graphState := GraphReady
+	graphState := GraphResolutionPending
 	var graphSnapshotID string
 	if c.Graph != nil {
 		resolution, graphErr := c.Graph.Resolve(ctx, GraphResolveRequest{RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, References: refs})
@@ -206,6 +224,7 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 		} else {
 			refs = resolution.References
 			graphSnapshotID = resolution.GraphSnapshotID
+			graphState = GraphReady
 			if publisher, ok := c.Graph.(GraphPublisher); ok {
 				_, publishErr := publisher.Publish(ctx, GraphSnapshot{RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, References: refs})
 				if publishErr != nil {
@@ -218,12 +237,25 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 	if err := c.Memory.SaveDiary(ctx, diary); err != nil {
 		return SessionDiary{}, Delivery{}, err
 	}
+	var storageResult StorageResult
+	if c.Storage != nil {
+		storageResult = c.Storage.Mirror(ctx, diary)
+	}
 	if c.Bus == nil {
 		return diary, Delivery{EventID: diary.SessionID}, nil
 	}
 	payload, _ := json.Marshal(diary)
 	e := Event{EventID: diary.SessionID, Type: "session.closed", OccurredAt: now, RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, SchemaVersion: 1, Payload: payload}
 	delivery, err := c.Bus.Publish(ctx, e)
+	if err == nil && c.Storage != nil && storageResult.State != "mirrored" {
+		// The diary remains successful locally; the mirror obligation is
+		// surfaced by a causal event and can be retried explicitly.
+		pending, _ := json.Marshal(storageResult)
+		storageEvent := Event{EventID: diary.SessionID + ":storage", Type: "storage.sync.pending", OccurredAt: now, RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: e.EventID, SchemaVersion: 1, Payload: pending}
+		if journal, ok := c.Bus.journal.(*SagaJournal); ok {
+			_ = journal.AppendEvent(ctx, storageEvent)
+		}
+	}
 	return diary, delivery, err
 }
 

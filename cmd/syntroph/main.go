@@ -4,12 +4,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/mateusememe/syntroph/core"
 )
@@ -22,8 +24,14 @@ func main() {
 }
 
 func run(args []string, out, errOut interface{ Write([]byte) (int, error) }) error {
-	if len(args) < 2 || args[0] != "sync" {
-		return errors.New("usage: syntroph sync <status|recovery|retry|resolve>")
+	if len(args) < 2 {
+		return errors.New("usage: syntroph session close | sync <status|recovery|retry|resolve>")
+	}
+	if args[0] == "session" && args[1] == "close" {
+		return closeSession(args[2:], out, errOut)
+	}
+	if args[0] != "sync" {
+		return errors.New("usage: syntroph session close | sync <status|recovery|retry|resolve>")
 	}
 	journalDir := filepath.Join(".syntroph", "journal")
 	if len(args) >= 3 && strings.HasPrefix(args[1], "--journal=") {
@@ -60,11 +68,18 @@ func run(args []string, out, errOut interface{ Write([]byte) (int, error) }) err
 		}
 		fmt.Fprintln(out, "Recovery plan (no external effects are executed automatically):")
 		for _, item := range items {
-			fmt.Fprintf(out, "- saga %s: %s; next: %s\n", item.SagaID, item.State, item.NextAction)
+			fmt.Fprintf(out, "- saga %s: %s; attempts: %d; last error: %s; next: %s\n", item.SagaID, item.State, len(item.Attempts), item.LastError, item.NextAction)
+			for _, attempt := range item.Attempts {
+				fmt.Fprintf(out, "  attempt %s/%s at %s: %s", attempt.HandlerID, attempt.EventID, attempt.AttemptedAt.Format(time.RFC3339Nano), attempt.Outcome)
+				if attempt.Error != "" {
+					fmt.Fprintf(out, " (%s)", attempt.Error)
+				}
+				fmt.Fprintln(out)
+			}
 		}
 		return nil
 	case "retry":
-		return retry(args[2:], out)
+		return retry(args[2:], j, out)
 	case "resolve":
 		return resolve(args[2:], out)
 	default:
@@ -72,7 +87,48 @@ func run(args []string, out, errOut interface{ Write([]byte) (int, error) }) err
 	}
 }
 
-func retry(args []string, out interface{ Write([]byte) (int, error) }) error {
+func closeSession(args []string, out, errOut interface{ Write([]byte) (int, error) }) error {
+	fs := flag.NewFlagSet("session close", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	artifact, format, summary := fs.String("artifact", "", "Markdown or JSON artifact"), fs.String("format", "", "json or markdown"), fs.String("summary", "", "manual summary")
+	repo, sha, author, runtime, root := fs.String("repository", "", "repository identity"), fs.String("commit", "", "commit SHA"), fs.String("author", "", "author"), fs.String("runtime", "", "runtime"), fs.String("root", ".syntroph", "Syntroph data root")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *repo == "" || *sha == "" {
+		return errors.New("session close requires --repository and --commit")
+	}
+	var data []byte
+	var err error
+	if *artifact != "" {
+		data, err = os.ReadFile(*artifact)
+		if err != nil {
+			return err
+		}
+	}
+	journal, err := core.NewSagaJournal(filepath.Join(*root, "journal"))
+	if err != nil {
+		return err
+	}
+	bus, err := core.NewEventBus(journal)
+	if err != nil {
+		return err
+	}
+	memory := core.LocalMemoryStore{Root: filepath.Join(*root, "memory")}
+	formatValue := core.ArtifactFormat(strings.ToLower(*format))
+	diary, delivery, err := (core.SessionCloser{Memory: memory, Bus: bus}).Close(context.Background(), core.SessionCloseRequest{RepositoryID: *repo, CommitSHA: *sha, Author: *author, Runtime: *runtime, Artifact: data, Format: formatValue, ManualSummary: *summary})
+	if err != nil {
+		return err
+	}
+	b, _ := json.MarshalIndent(struct {
+		Diary    core.SessionDiary `json:"diary"`
+		Delivery core.Delivery     `json:"delivery"`
+	}{diary, delivery}, "", "  ")
+	_, _ = out.Write(append(b, '\n'))
+	return nil
+}
+
+func retry(args []string, journal *core.SagaJournal, out interface{ Write([]byte) (int, error) }) error {
 	fs := flag.NewFlagSet("sync retry", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	graph, storage := fs.Bool("graph", false, "retry graph obligations"), fs.Bool("storage", false, "retry storage obligations")
@@ -86,9 +142,22 @@ func retry(args []string, out interface{ Write([]byte) (int, error) }) error {
 	if *storage {
 		scope = "storage"
 	}
-	// The explicit command records intent at the boundary. Adapter wiring is
-	// supplied by the embedding runtime/MCP; no effect is attempted here.
-	fmt.Fprintf(out, "Retry requested for %s synchronization. No external effects were executed; run through the configured adapter.\n", scope)
+	items, err := core.InspectRecovery(context.Background(), journal)
+	if err != nil {
+		return err
+	}
+	count := 0
+	for _, item := range items {
+		if (scope == "graph" && item.State != core.GraphResolutionPending && item.State != core.GraphSyncPending) || (scope == "storage" && item.State == core.GraphResolutionPending) {
+			continue
+		}
+		e := core.Event{EventID: item.SagaID + ":retry:" + scope, Type: "sync.retry.requested", OccurredAt: time.Now().UTC(), RepositoryID: item.RepositoryID, SagaID: item.SagaID, CorrelationID: item.SagaID, CausationID: item.EventID, SchemaVersion: 1, Payload: []byte(fmt.Sprintf(`{"scope":%q}`, scope))}
+		if err := journal.AppendEvent(context.Background(), e); err != nil {
+			return err
+		}
+		count++
+	}
+	fmt.Fprintf(out, "Retry requested for %s synchronization for %d saga(s). External effects require the configured adapter.\n", scope, count)
 	return nil
 }
 
