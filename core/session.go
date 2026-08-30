@@ -109,6 +109,21 @@ func parseMarkdownArtifact(markdown string) (SessionArtifact, error) {
 				a.Lessons = append(a.Lessons, value)
 			case "related", "related links":
 				a.Related = append(a.Related, value)
+			case "code references", "code reference", "references":
+				var ref CodeReference
+				if json.Unmarshal([]byte(value), &ref) == nil {
+					a.CodeReferences = append(a.CodeReferences, ref)
+				} else {
+					parts := strings.Split(value, "|")
+					ref.Path = strings.TrimSpace(parts[0])
+					if len(parts) > 1 {
+						ref.Symbol = strings.TrimSpace(parts[1])
+					}
+					if len(parts) > 2 {
+						ref.Kind = strings.TrimSpace(parts[2])
+					}
+					a.CodeReferences = append(a.CodeReferences, ref)
+				}
 			default:
 				body = append(body, value)
 			}
@@ -164,7 +179,14 @@ type StoragePort interface {
 	Mirror(context.Context, SessionDiary) StorageResult
 }
 
+// EventAwareStoragePort lets external mirrors use the immutable event ID as
+// their idempotency key while retaining the diary's artifact key.
+type EventAwareStoragePort interface {
+	MirrorEvent(context.Context, string, SessionDiary) StorageResult
+}
+
 type StorageResult struct {
+	EventID     string
 	State       string
 	Backend     string
 	Key         string
@@ -239,7 +261,11 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 	}
 	var storageResult StorageResult
 	if c.Storage != nil {
-		storageResult = c.Storage.Mirror(ctx, diary)
+		if mirror, ok := c.Storage.(EventAwareStoragePort); ok {
+			storageResult = mirror.MirrorEvent(ctx, diary.SessionID, diary)
+		} else {
+			storageResult = c.Storage.Mirror(ctx, diary)
+		}
 	}
 	if c.Bus == nil {
 		return diary, Delivery{EventID: diary.SessionID}, nil
@@ -340,13 +366,35 @@ func (s LocalMemoryStore) SaveDiary(ctx context.Context, d SessionDiary) error {
 	return os.Rename(name, path)
 }
 
-func renderDiary(d SessionDiary) string {
+func RenderSessionDiary(d SessionDiary) string {
 	refs, _ := json.Marshal(d.CodeReferences)
 	related := append([]string(nil), d.Related...)
 	sort.Strings(related)
 	metadata, _ := json.Marshal(d)
-	return fmt.Sprintf("---\nsession_id: %s\nidempotency_key: %s\nrepository_id: %s\ncommit_sha: %s\nartifact_hash: %s\nauthor: %s\nruntime: %s\ncreated_at: %s\ntitle: %s\ncode_references: %s\nrelated: %s\n---\n\n<!-- syntroph-metadata\n%s\n-->\n\n# %s\n\n%s\n", d.SessionID, d.IdempotencyKey, d.RepositoryID, d.CommitSHA, d.ArtifactHash, d.Author, d.Runtime, d.CreatedAt.Format(time.RFC3339Nano), d.Title, refs, strings.Join(related, ","), metadata, d.Title, d.Summary)
+	var sections strings.Builder
+	sections.WriteString(d.Summary + "\n")
+	if len(d.Decisions) > 0 {
+		sections.WriteString("\n## Decisions\n")
+		for _, v := range d.Decisions {
+			sections.WriteString("- " + v + "\n")
+		}
+	}
+	if len(d.Lessons) > 0 {
+		sections.WriteString("\n## Lessons\n")
+		for _, v := range d.Lessons {
+			sections.WriteString("- " + v + "\n")
+		}
+	}
+	if len(d.CodeReferences) > 0 {
+		sections.WriteString("\n## Code References\n")
+		for _, v := range d.CodeReferences {
+			sections.WriteString("- " + v.Path + " | " + v.Symbol + " | " + v.Kind + "\n")
+		}
+	}
+	return fmt.Sprintf("---\nsession_id: %s\nidempotency_key: %s\nrepository_id: %s\ncommit_sha: %s\nartifact_hash: %s\nauthor: %s\nruntime: %s\ncreated_at: %s\ntitle: %s\ncode_references: %s\nrelated: %s\n---\n\n<!-- syntroph-metadata\n%s\n-->\n\n# %s\n\n%s", d.SessionID, d.IdempotencyKey, d.RepositoryID, d.CommitSHA, d.ArtifactHash, d.Author, d.Runtime, d.CreatedAt.Format(time.RFC3339Nano), d.Title, refs, strings.Join(related, ","), metadata, d.Title, sections.String())
 }
+
+func renderDiary(d SessionDiary) string { return RenderSessionDiary(d) }
 
 func extractMetadata(content string) string {
 	const marker = "<!-- syntroph-metadata\n"

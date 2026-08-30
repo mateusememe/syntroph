@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mateusememe/syntroph/adapters/graphify"
 	"github.com/mateusememe/syntroph/core"
 )
 
@@ -115,8 +116,16 @@ func closeSession(args []string, out, errOut interface{ Write([]byte) (int, erro
 		return err
 	}
 	memory := core.LocalMemoryStore{Root: filepath.Join(*root, "memory")}
+	// LocalGraphPort is the deterministic default. Set graphify_executable in
+	// .syntroph/config.json to exercise the optional real adapter.
+	var graph core.GraphPort
+	if executable := configuredString(filepath.Join(*root, "config.json"), "graphify_executable"); executable != "" {
+		graph = graphify.New(executable)
+	} else if local, e := core.NewLocalGraphPort(filepath.Join(*root, "graph")); e == nil {
+		graph = local
+	}
 	formatValue := core.ArtifactFormat(strings.ToLower(*format))
-	diary, delivery, err := (core.SessionCloser{Memory: memory, Bus: bus}).Close(context.Background(), core.SessionCloseRequest{RepositoryID: *repo, CommitSHA: *sha, Author: *author, Runtime: *runtime, Artifact: data, Format: formatValue, ManualSummary: *summary})
+	diary, delivery, err := (core.SessionCloser{Memory: memory, Bus: bus, Graph: graph}).Close(context.Background(), core.SessionCloseRequest{RepositoryID: *repo, CommitSHA: *sha, Author: *author, Runtime: *runtime, Artifact: data, Format: formatValue, ManualSummary: *summary})
 	if err != nil {
 		return err
 	}
@@ -126,6 +135,18 @@ func closeSession(args []string, out, errOut interface{ Write([]byte) (int, erro
 	}{diary, delivery}, "", "  ")
 	_, _ = out.Write(append(b, '\n'))
 	return nil
+}
+
+func configuredString(path, key string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var cfg map[string]string
+	if json.Unmarshal(b, &cfg) != nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg[key])
 }
 
 func retry(args []string, journal *core.SagaJournal, out interface{ Write([]byte) (int, error) }) error {
@@ -155,10 +176,45 @@ func retry(args []string, journal *core.SagaJournal, out interface{ Write([]byte
 		if err := journal.AppendEvent(context.Background(), e); err != nil {
 			return err
 		}
+		if scope == "graph" {
+			if err := retryGraph(context.Background(), journal, item); err != nil {
+				attempt := core.HandlerAttempt{EventID: e.EventID, SagaID: item.SagaID, HandlerID: "graph-retry", AttemptedAt: time.Now().UTC(), Outcome: "failed", Error: err.Error()}
+				if appendErr := journal.AppendAttempt(context.Background(), attempt); appendErr != nil {
+					return appendErr
+				}
+				continue
+			}
+			if err := journal.AppendAttempt(context.Background(), core.HandlerAttempt{EventID: e.EventID, SagaID: item.SagaID, HandlerID: "graph-retry", AttemptedAt: time.Now().UTC(), Outcome: "succeeded"}); err != nil {
+				return err
+			}
+		}
 		count++
 	}
 	fmt.Fprintf(out, "Retry requested for %s synchronization for %d saga(s). External effects require the configured adapter.\n", scope, count)
 	return nil
+}
+
+func retryGraph(ctx context.Context, journal *core.SagaJournal, item core.RecoveryItem) error {
+	records, err := journal.ReadSaga(ctx, item.SagaID)
+	if err != nil {
+		return err
+	}
+	var diary core.SessionDiary
+	for _, r := range records {
+		if r.Event != nil {
+			_ = json.Unmarshal(r.Event.Payload, &diary)
+		}
+	}
+	graph, err := core.NewLocalGraphPort(filepath.Join(".syntroph", "graph"))
+	if err != nil {
+		return err
+	}
+	res, err := graph.Resolve(ctx, core.GraphResolveRequest{RepositoryID: diary.RepositoryID, CommitSHA: diary.CommitSHA, References: diary.CodeReferences})
+	if err != nil {
+		return err
+	}
+	_, err = graph.Publish(ctx, core.GraphSnapshot{RepositoryID: diary.RepositoryID, CommitSHA: diary.CommitSHA, References: res.References})
+	return err
 }
 
 func resolve(args []string, out interface{ Write([]byte) (int, error) }) error {
