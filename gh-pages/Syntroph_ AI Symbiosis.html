@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script>
+window.contextInfo = {"files":[],"materials":[],"crafts":[]};
+// 处理锚点链接跳转（srcDoc iframe 中锚点链接默认行为不正确）
+document.addEventListener('click', function(e) {
+  var anchor = e.target.closest('a');
+  if (anchor) {
+    var href = anchor.getAttribute('href');
+    if (href && href.startsWith('#')) {
+      e.preventDefault();
+      var targetId = href.slice(1);
+      var target = document.getElementById(targetId);
+      if (target) {
+        target.scrollIntoView({ behavior: 'smooth' });
+      }
+    }
+  }
+});
+</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Syntroph — Coding agents that feed each other</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;0,700;1,400&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#05090d;
+    --bg2:#071014;
+    --bg3:#0a1218;
+    --green:#7dffb2;
+    --green2:#4ade80;
+    --teal:#22d3ee;
+    --violet:#a855f7;
+    --violet2:#8b5cf6;
+    --amber:#fde68a;
+    --amber2:#fff4d6;
+    --ink:#d8fff0;
+    --ink-dim:#9db9b0;
+    --ink-mute:#5d7a72;
+    --line:rgba(125,255,178,0.12);
+    --font-d:'Space Grotesk',sans-serif;
+    --font-m:'JetBrains Mono',monospace;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    background:var(--bg);
+    color:var(--ink);
+    font-family:var(--font-d);
+    line-height:1.6;
+    overflow-x:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+  ::selection{background:rgba(125,255,178,0.25);color:#eafff4;}
+  ::-webkit-scrollbar{width:10px;background:#05090d;}
+  ::-webkit-scrollbar-thumb{background:linear-gradient(var(--green),var(--teal));border-radius:8px;}
+
+  /* ambient background layers */
+  .bg-grid{
+    position:fixed;inset:0;z-index:-3;pointer-events:none;
+    background-image:
+      radial-gradient(circle at 20% 10%, rgba(34,211,238,0.10), transparent 40%),
+      radial-gradient(circle at 80% 20%, rgba(168,85,247,0.10), transparent 40%),
+      radial-gradient(circle at 50% 90%, rgba(125,255,178,0.08), transparent 45%);
+  }
+  .bg-neural{
+    position:fixed;inset:0;z-index:-2;pointer-events:none;opacity:.5;
+    background-image:
+      linear-gradient(rgba(125,255,178,0.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(125,255,178,0.05) 1px, transparent 1px);
+    background-size:56px 56px;
+    -webkit-mask-image:radial-gradient(circle at 50% 30%, #000 0%, transparent 75%);
+            mask-image:radial-gradient(circle at 50% 30%, #000 0%, transparent 75%);
+  }
+  .bg-noise{
+    position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.06;
+    background-image:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="140" height="140"><filter id="n"><feTurbulence type="fractalNoise" baseFrequency="0.85" numOctaves="2"/></filter><rect width="140" height="140" filter="url(%23n)" opacity="0.6"/></svg>');
+    mix-blend-mode:overlay;
+  }
+  .scanlines{
+    position:fixed;inset:0;z-index:40;pointer-events:none;opacity:.35;
+    background:repeating-linear-gradient(0deg, transparent 0 2px, rgba(0,0,0,0.12) 2px 4px);
+    mix-blend-mode:overlay;
+  }
+
+  /* drift particles */
+  #drift{position:fixed;inset:0;z-index:-1;pointer-events:none;}
+
+  .wrap{max-width:1200px;margin:0 auto;padding:0 24px;}
+
+  /* NAV */
+  header{
+    position:sticky;top:0;z-index:50;
+    backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+    background:rgba(5,9,13,0.55);
+    border-bottom:1px solid var(--line);
+  }
+  nav{display:flex;align-items:center;justify-content:space-between;height:72px;}
+  .logo{display:flex;align-items:center;gap:12px;text-decoration:none;color:var(--ink);font-weight:700;font-size:1.15rem;letter-spacing:.5px;}
+  .logo svg{filter:drop-shadow(0 0 6px rgba(125,255,178,0.7));}
+  .logo em{font-style:normal;color:var(--green);}
+  .nav-links{display:flex;align-items:center;gap:32px;list-style:none;}
+  .nav-links a{color:var(--ink-dim);text-decoration:none;font-family:var(--font-m);font-size:.82rem;letter-spacing:.5px;transition:color .25s, text-shadow .25s;}
+  .nav-links a:hover{color:var(--green);text-shadow:0 0 12px rgba(125,255,178,0.6);}
+  .nav-cta{
+    display:inline-flex;align-items:center;gap:8px;
+    padding:10px 18px;border-radius:999px;text-decoration:none;
+    font-family:var(--font-m);font-size:.82rem;font-weight:700;color:#03130c;
+    background:linear-gradient(135deg,var(--green),var(--teal));
+    box-shadow:0 0 24px rgba(34,211,238,0.35),0 0 0 1px rgba(125,255,178,0.3);
+    transition:transform .3s, box-shadow .3s;
+    animation:ctaPulse 4s ease-in-out infinite;
+  }
+  .nav-cta:hover{transform:translateY(-2px);box-shadow:0 0 38px rgba(125,255,178,0.6),0 0 0 1px rgba(125,255,178,0.5);}
+  @keyframes ctaPulse{0%,100%{box-shadow:0 0 18px rgba(34,211,238,0.3),0 0 0 1px rgba(125,255,178,0.3);}50%{box-shadow:0 0 32px rgba(125,255,178,0.55),0 0 0 1px rgba(125,255,178,0.4);}}
+  .burger{display:none;background:none;border:1px solid var(--line);color:var(--green);border-radius:8px;padding:8px 10px;cursor:pointer;font-size:1.1rem;}
+
+  /* HERO */
+  .hero{position:relative;min-height:100vh;display:flex;align-items:center;padding:60px 0 40px;overflow:hidden;}
+  #hero-canvas{position:absolute;inset:0;width:100%;height:100%;z-index:0;}
+  .hero-inner{position:relative;z-index:2;max-width:820px;margin:0 auto;text-align:center;pointer-events:none;}
+  .hero-inner *{pointer-events:auto;}
+  .eyebrow{
+    display:inline-flex;align-items:center;gap:10px;
+    font-family:var(--font-m);font-size:.75rem;letter-spacing:3px;color:var(--teal);
+    border:1px solid rgba(34,211,238,0.25);border-radius:999px;
+    padding:7px 16px;background:rgba(34,211,238,0.05);
+    box-shadow:inset 0 0 20px rgba(34,211,238,0.08);
+    text-transform:uppercase;
+  }
+  .eyebrow .dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green);animation:blink 2.2s infinite;}
+  @keyframes blink{0%,100%{opacity:1;}50%{opacity:.3;}}
+  h1{
+    font-size:clamp(2.4rem,6.2vw,4.6rem);line-height:1.02;font-weight:700;letter-spacing:-1px;
+    margin:26px 0 22px;color:#eafff4;
+    text-shadow:0 0 40px rgba(125,255,178,0.18);
+  }
+  h1 .g{background:linear-gradient(100deg,var(--green),var(--teal),var(--violet));-webkit-background-clip:text;background-clip:text;color:transparent;}
+  h1 .a{color:var(--amber2);text-shadow:0 0 30px rgba(253,230,138,0.35);}
+  .sub{max-width:640px;margin:0 auto 34px;font-size:1.13rem;color:var(--ink-dim);}
+  .sub strong{color:var(--ink);font-weight:600;}
+  .sub .mono{font-family:var(--font-m);font-size:.92em;color:var(--teal);}
+  .hero-ctas{display:flex;gap:16px;justify-content:center;flex-wrap:wrap;margin-bottom:44px;}
+  .btn{
+    display:inline-flex;align-items:center;gap:9px;padding:14px 26px;border-radius:12px;
+    text-decoration:none;font-family:var(--font-m);font-size:.9rem;font-weight:700;letter-spacing:.3px;
+    transition:transform .3s, box-shadow .3s, background .3s, border-color .3s;
+  }
+  .btn-primary{
+    color:#03130c;background:linear-gradient(135deg,var(--green),var(--teal));
+    box-shadow:0 0 30px rgba(34,211,238,0.35),0 0 0 1px rgba(125,255,178,0.35);
+    animation:ctaPulse 4.5s ease-in-out infinite;
+  }
+  .btn-primary:hover{transform:translateY(-3px) scale(1.02);}
+  .btn-ghost{
+    color:var(--green);border:1px solid rgba(125,255,178,0.35);
+    background:rgba(125,255,178,0.04);
+  }
+  .btn-ghost:hover{border-color:var(--green);background:rgba(125,255,178,0.10);box-shadow:0 0 24px rgba(125,255,178,0.25);}
+
+  /* terminal snippet */
+  .term{
+    max-width:600px;margin:0 auto;text-align:left;
+    background:rgba(7,16,20,0.85);border:1px solid var(--line);border-radius:14px;
+    box-shadow:0 20px 60px rgba(0,0,0,0.5),0 0 40px rgba(34,211,238,0.08), inset 0 1px 0 rgba(255,255,255,0.03);
+    font-family:var(--font-m);font-size:.85rem;overflow:hidden;
+    backdrop-filter:blur(8px);
+  }
+  .term-bar{display:flex;align-items:center;gap:8px;padding:11px 16px;border-bottom:1px solid var(--line);}
+  .term-bar .t{width:11px;height:11px;border-radius:50%;}
+  .term-bar .t1{background:#ff5f57;}.term-bar .t2{background:#febc2e;}.term-bar .t3{background:#28c840;}
+  .term-bar span:last-child{margin-left:auto;color:var(--ink-mute);font-size:.7rem;letter-spacing:1px;}
+  .term-body{padding:16px;line-height:1.7;}
+  .term-body .cm{color:var(--green2);}
+  .term-body .d{color:var(--ink-mute);}
+  .term-body .o{color:var(--amber2);}
+  .term-body .p{color:var(--violet);}
+  .term-body .c{color:var(--ink-dim);}
+  .term-body .ok{color:var(--green);}
+  .term-body .b{color:var(--teal);}
+  .caret{display:inline-block;width:8px;height:15px;background:var(--green);vertical-align:text-bottom;animation:caret 1s steps(1) infinite;}
+  @keyframes caret{0%,49%{opacity:1;}50%,100%{opacity:0;}}
+
+  /* section base */
+  section{padding:100px 0;position:relative;}
+  .sec-tag{
+    font-family:var(--font-m);font-size:.72rem;letter-spacing:3px;color:var(--violet);text-transform:uppercase;margin-bottom:14px;display:flex;align-items:center;gap:10px;
+  }
+  .sec-tag::before{content:"";width:26px;height:1px;background:linear-gradient(90deg,transparent,var(--violet));}
+  .sec-tag::after{content:"";width:26px;height:1px;background:linear-gradient(90deg,var(--violet),transparent);}
+  h2{font-size:clamp(1.9rem,4vw,3rem);font-weight:700;letter-spacing:-.5px;line-height:1.12;color:#eafff4;margin-bottom:16px;}
+  h2 .g{background:linear-gradient(100deg,var(--green),var(--teal));-webkit-background-clip:text;background-clip:text;color:transparent;}
+  .sec-lead{max-width:680px;color:var(--ink-dim);font-size:1.05rem;}
+
+  /* EXPLAINER */
+  .explainer-grid{display:grid;grid-template-columns:1fr 1fr;gap:60px;align-items:center;margin-top:40px;}
+  .explain-copy p{margin-bottom:18px;color:var(--ink-dim);}
+  .explain-copy p b{color:var(--ink);}
+  .explain-copy p .em{color:var(--green);font-weight:600;}
+  .org-card{
+    background:linear-gradient(160deg, rgba(125,255,178,0.05), rgba(168,85,247,0.05));
+    border:1px solid var(--line);border-radius:18px;padding:22px;margin-bottom:16px;
+    transition:transform .3s, box-shadow .3s;
+  }
+  .org-card:hover{transform:translateY(-3px);box-shadow:0 0 40px rgba(125,255,178,0.12);}
+  .org-card .tag{font-family:var(--font-m);font-size:.7rem;letter-spacing:2px;color:var(--teal);text-transform:uppercase;margin-bottom:6px;}
+  .org-card h4{font-size:1.05rem;margin-bottom:6px;color:var(--ink);}
+  .org-card p{font-size:.95rem;color:var(--ink-dim);margin:0;}
+
+  /* diagram */
+  .diagram{position:relative;width:100%;aspect-ratio:1/1;max-width:460px;margin:0 auto;}
+  .diagram .node{
+    position:absolute;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    text-align:center;border-radius:50%;font-family:var(--font-m);font-size:.7rem;
+    letter-spacing:.5px;z-index:2;transition:transform .3s, box-shadow .3s;
+  }
+  .diagram .node .ico{margin-bottom:4px;}
+  .diagram .center{
+    left:50%;top:50%;transform:translate(-50%,-50%);
+    width:150px;height:150px;color:#03130c;font-weight:700;
+    background:radial-gradient(circle at 35% 30%, #fff4d6, var(--amber) 40%, #eab308 70%, #b45309);
+    box-shadow:0 0 60px rgba(253,230,138,0.55),0 0 120px rgba(253,230,138,0.25), inset 0 0 30px rgba(255,255,255,0.3);
+    animation:coreGlow 3.5s ease-in-out infinite;z-index:3;
+  }
+  .diagram .center .ico{color:#4a1f00;}
+  .diagram .center small{font-weight:500;font-size:.6rem;max-width:110px;line-height:1.25;color:#4a2a00;}
+  @keyframes coreGlow{0%,100%{box-shadow:0 0 50px rgba(253,230,138,0.5),0 0 100px rgba(253,230,138,0.2), inset 0 0 30px rgba(255,255,255,0.3);}50%{box-shadow:0 0 80px rgba(253,230,138,0.8),0 0 160px rgba(253,230,138,0.35), inset 0 0 40px rgba(255,255,255,0.4);}}
+  .diagram .agent{
+    width:118px;height:118px;background:rgba(7,16,20,0.9);border:1px solid var(--line);
+    color:var(--ink);
+  }
+  .diagram .agent:hover{border-color:var(--green);box-shadow:0 0 30px rgba(125,255,178,0.25);transform:translate(-50%,-50%) scale(1.06);}
+  .diagram .a1{left:0;top:0;}
+  .diagram .a2{right:0;top:0;}
+  .diagram .a3{left:50%;bottom:0;transform:translateX(-50%);}
+  .diagram .a3:hover{transform:translateX(-50%) scale(1.06);}
+  .diagram .a1 .ico,.diagram .a2 .ico,.diagram .a3 .ico{color:var(--green);}
+  .diagram svg.links{position:absolute;inset:0;width:100%;height:100%;z-index:1;}
+  .diagram svg.links line{stroke-width:1.6;stroke-dasharray:6 7;animation:dash 14s linear infinite;}
+  .diagram svg.links line:hover{stroke-width:2.4;}
+  .diagram .pulse-node{position:absolute;width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 12px var(--green);z-index:2;animation:nodePulse 2.4s infinite;}
+  @keyframes nodePulse{0%,100%{opacity:.4;transform:scale(.8);}50%{opacity:1;transform:scale(1.3);}}
+  @keyframes dash{to{stroke-dashoffset:-260;}}
+
+  /* FEATURES */
+  .feat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:22px;margin-top:46px;}
+  .feat{
+    position:relative;padding:28px;border-radius:18px;background:linear-gradient(160deg, rgba(7,16,20,0.9), rgba(10,18,24,0.7));
+    border:1px solid var(--line);overflow:hidden;transition:transform .35s, border-color .35s, box-shadow .35s;
+  }
+  .feat::before{content:"";position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--green),transparent);opacity:0;transition:opacity .35s;}
+  .feat:hover{transform:translateY(-6px);border-color:rgba(125,255,178,0.35);box-shadow:0 20px 50px rgba(0,0,0,0.5),0 0 40px rgba(125,255,178,0.12);}
+  .feat:hover::before{opacity:1;}
+  .feat .f-ico{
+    width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;margin-bottom:20px;
+    background:rgba(125,255,178,0.06);border:1px solid rgba(125,255,178,0.15);color:var(--green);
+    box-shadow:inset 0 0 20px rgba(125,255,178,0.06);
+  }
+  .feat .f-tag{font-family:var(--font-m);font-size:.66rem;letter-spacing:2px;color:var(--teal);text-transform:uppercase;margin-bottom:8px;}
+  .feat h3{font-size:1.15rem;margin-bottom:8px;color:var(--ink);}
+  .feat p{font-size:.92rem;color:var(--ink-dim);}
+
+  /* AGENTS */
+  .agents-row{display:grid;grid-template-columns:repeat(3,1fr);gap:22px;margin-top:46px;}
+  .agent-card{
+    position:relative;padding:30px;border-radius:18px;background:rgba(7,16,20,0.85);border:1px solid var(--line);
+    transition:transform .35s, border-color .35s, box-shadow .35s;
+  }
+  .agent-card:hover{transform:translateY(-6px);border-color:rgba(168,85,247,0.4);box-shadow:0 20px 50px rgba(0,0,0,0.5),0 0 44px rgba(168,85,247,0.15);}
+  .agent-card .ac-head{display:flex;align-items:center;gap:14px;margin-bottom:18px;}
+  .agent-card .ac-logo{width:46px;height:46px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:1.2rem;font-weight:700;color:#03130c;background:linear-gradient(135deg,var(--green),var(--teal));box-shadow:0 0 20px rgba(125,255,178,0.3);}
+  .agent-card.cc .ac-logo{background:linear-gradient(135deg,#eab308,#f97316);box-shadow:0 0 20px rgba(234,179,8,0.3);}
+  .agent-card.cx .ac-logo{background:linear-gradient(135deg,var(--teal),var(--violet));box-shadow:0 0 20px rgba(34,211,238,0.3);}
+  .agent-card .ac-name{font-weight:700;font-size:1.1rem;color:var(--ink);}
+  .agent-card .ac-ver{font-family:var(--font-m);font-size:.7rem;color:var(--ink-mute);}
+  .agent-card ul{list-style:none;margin-top:6px;}
+  .agent-card li{font-size:.9rem;color:var(--ink-dim);padding:8px 0 8px 22px;position:relative;border-top:1px dashed rgba(125,255,178,0.08);}
+  .agent-card li::before{content:"›";position:absolute;left:4px;color:var(--green);font-weight:700;}
+  .agent-card .ac-syn{font-family:var(--font-m);font-size:.7rem;color:var(--amber2);margin-top:14px;padding-top:12px;border-top:1px solid var(--line);letter-spacing:.5px;}
+
+  /* CODE SAMPLE */
+  .code-wrap{max-width:760px;margin:46px auto 0;}
+  .code-head{display:flex;align-items:center;justify-content:space-between;padding:12px 18px;border:1px solid var(--line);border-bottom:none;border-radius:14px 14px 0 0;background:rgba(10,18,24,0.9);}
+  .code-head .file{font-family:var(--font-m);font-size:.8rem;color:var(--teal);}
+  .code-head .file::before{content:"📄 ";opacity:.6;}
+  .copy-btn{display:inline-flex;align-items:center;gap:7px;font-family:var(--font-m);font-size:.75rem;color:var(--green);background:rgba(125,255,178,0.06);border:1px solid rgba(125,255,178,0.25);padding:7px 12px;border-radius:8px;cursor:pointer;transition:all .25s;}
+  .copy-btn:hover{background:rgba(125,255,178,0.15);box-shadow:0 0 20px rgba(125,255,178,0.2);}
+  .code-box{position:relative;background:#04080b;border:1px solid var(--line);border-radius:0 0 14px 14px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,0.5),0 0 50px rgba(34,211,238,0.05);}
+  .code-box pre{padding:24px;overflow-x:auto;font-family:var(--font-m);font-size:.82rem;line-height:1.75;color:#c8f7df;}
+  .code-box code .kw{color:var(--violet);}
+  .code-box code .st{color:var(--amber2);}
+  .code-box code .fn{color:var(--teal);}
+  .code-box code .cm{color:var(--ink-mute);font-style:italic;}
+  .code-box code .nm{color:var(--green);}
+  .code-box code .pr{color:var(--ink-dim);}
+  .ln{display:block;}
+  .ln-num{display:inline-block;width:34px;color:#3a524b;user-select:none;}
+
+  /* CTA BAND */
+  .cta-band{text-align:center;padding:110px 0;}
+  .cta-band h2{font-size:clamp(2rem,5vw,3.4rem);}
+  .cta-line{font-family:var(--font-m);color:var(--ink-mute);margin-bottom:34px;font-size:.9rem;}
+  .cta-line .g{color:var(--green);}.cta-line .t{color:var(--teal);}.cta-line .v{color:var(--violet);}
+  .cta-buttons{display:flex;gap:18px;justify-content:center;flex-wrap:wrap;}
+
+  /* FOOTER */
+  footer{border-top:1px solid var(--line);background:rgba(5,9,13,0.7);padding:56px 0 40px;}
+  .foot-grid{display:grid;grid-template-columns:2fr 1fr 1fr;gap:40px;}
+  .foot-brand p{color:var(--ink-mute);font-size:.9rem;margin-top:14px;max-width:340px;}
+  .foot-col h5{font-family:var(--font-m);font-size:.72rem;letter-spacing:2px;color:var(--teal);text-transform:uppercase;margin-bottom:16px;}
+  .foot-col a{display:block;color:var(--ink-dim);text-decoration:none;font-size:.9rem;padding:5px 0;transition:color .25s;}
+  .foot-col a:hover{color:var(--green);}
+  .foot-bottom{margin-top:44px;padding-top:24px;border-top:1px solid rgba(125,255,178,0.08);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px;color:var(--ink-mute);font-size:.82rem;}
+  .foot-bottom .mono{font-family:var(--font-m);}
+
+  /* reveal */
+  .reveal{opacity:0;transform:translateY(34px);transition:opacity .8s ease, transform .8s ease;}
+  .reveal.in{opacity:1;transform:none;}
+  .stagger > *{opacity:0;transform:translateY(26px);transition:opacity .7s ease, transform .7s ease;}
+  .stagger.in > *{opacity:1;transform:none;}
+  .stagger.in > *:nth-child(1){transition-delay:.05s;}
+  .stagger.in > *:nth-child(2){transition-delay:.15s;}
+  .stagger.in > *:nth-child(3){transition-delay:.25s;}
+  .stagger.in > *:nth-child(4){transition-delay:.35s;}
+  .stagger.in > *:nth-child(5){transition-delay:.45s;}
+  .stagger.in > *:nth-child(6){transition-delay:.55s;}
+
+  @media (max-width:900px){
+    .explainer-grid{grid-template-columns:1fr;gap:40px;}
+    .feat-grid{grid-template-columns:1fr 1fr;}
+    .agents-row{grid-template-columns:1fr;}
+    .foot-grid{grid-template-columns:1fr;}
+  }
+  @media (max-width:640px){
+    .nav-links,.nav-cta{display:none;}
+    .burger{display:block;}
+    .feat-grid{grid-template-columns:1fr;}
+    h1{font-size:2.5rem;}
+    .diagram{max-width:340px;}
+    .diagram .center{width:120px;height:120px;}
+    .diagram .agent{width:96px;height:96px;font-size:.62rem;}
+    .diagram .center small{font-size:.52rem;}
+  }
+  .mobile-menu{position:fixed;top:72px;left:0;right:0;background:rgba(5,9,13,0.98);border-bottom:1px solid var(--line);padding:20px 24px;display:none;flex-direction:column;gap:16px;z-index:60;}
+  .mobile-menu a{color:var(--ink-dim);text-decoration:none;font-family:var(--font-m);font-size:.95rem;}
+  .mobile-menu.open{display:flex;}
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none !important;transition:none !important;}
+    html{scroll-behavior:auto;}
+    .reveal,.stagger > *{opacity:1;transform:none;}
+  }
+</style>
+</head>
+<body>
+
+<div class="bg-grid"></div>
+<div class="bg-neural"></div>
+<div class="bg-noise"></div>
+<canvas id="drift"></canvas>
+<div class="scanlines"></div>
+
+<!-- NAV -->
+<header>
+  <nav class="wrap">
+    <a href="#top" class="logo" aria-label="Syntroph home">
+      <svg width="30" height="30" viewBox="0 0 32 32" fill="none">
+        <circle cx="9" cy="16" r="6" stroke="#7dffb2" stroke-width="2" fill="rgba(125,255,178,0.12)"/>
+        <circle cx="23" cy="16" r="6" stroke="#22d3ee" stroke-width="2" fill="rgba(34,211,238,0.12)"/>
+        <circle cx="16" cy="16" r="2.4" fill="#fde68a"/>
+        <path d="M9 16 L16 16 L23 16" stroke="#fde68a" stroke-width="1.6" opacity="0.9"/>
+      </svg>
+      <span>Syntr<em>oph</em></span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="#docs">Docs</a></li>
+      <li><a href="#agents">Agents</a></li>
+      <li><a href="#memory">Memory</a></li>
+      <li><a href="#github" target="_blank" rel="noopener noreferrer">GitHub</a></li>
+    </ul>
+    <a href="#start" class="nav-cta">Get started →</a>
+    <button class="burger" aria-label="Menu" onclick="toggleMenu()">☰</button>
+  </nav>
+</header>
+<div class="mobile-menu" id="mobileMenu">
+  <a href="#docs" onclick="toggleMenu()">Docs</a>
+  <a href="#agents" onclick="toggleMenu()">Agents</a>
+  <a href="#memory" onclick="toggleMenu()">Memory</a>
+  <a href="#github" target="_blank" rel="noopener noreferrer" onclick="toggleMenu()">GitHub</a>
+  <a href="#start" onclick="toggleMenu()">Get started</a>
+</div>
+
+<!-- HERO -->
+<section class="hero" id="top">
+  <canvas id="hero-canvas"></canvas>
+  <div class="hero-inner wrap">
+    <span class="eyebrow"><span class="dot"></span>Open-Source Agent Orchestration</span>
+    <h1>Coding agents that <span class="g">feed each other</span>.<br><span class="a">One shared memory.</span></h1>
+    <p class="sub">Syntroph orchestrates <strong>Claude Code</strong>, <strong>Codex</strong> and <strong>Antigravity CLI</strong> around a living, evolving <span class="mono">memory &amp; code-knowledge graph</span> — every trace, decision and refactor becomes context for the next agent.</p>
+    <div class="hero-ctas">
+      <a href="#start" class="btn btn-primary">Get started</a>
+      <a href="#github" class="btn btn-ghost" target="_blank" rel="noopener noreferrer">⛭ View on GitHub</a>
+    </div>
+    <div class="term" aria-label="terminal">
+      <div class="term-bar">
+        <span class="t t1"></span><span class="t t2"></span><span class="t t3"></span>
+        <span>syntroph — shell</span>
+      </div>
+      <div class="term-body">
+        <div><span class="cm">$</span> <span class="o">npm i -g syntroph</span></div>
+        <div><span class="cm">$</span> <span class="o">syntroph init</span> <span class="c">// wiring shared memory…</span></div>
+        <div>&nbsp;&nbsp;<span class="b">›</span> agents: <span class="p">3</span> <span class="d">// memory syncing</span></div>
+        <div>&nbsp;&nbsp;<span class="b">›</span> claude-code <span class="ok">✓</span> &nbsp;codex <span class="ok">✓</span> &nbsp;antigravity <span class="ok">✓</span></div>
+        <div>&nbsp;&nbsp;<span class="b">›</span> graph warm. <span class="c">nodes: <span class="nm">1,842</span> · synapses: <span class="nm">9,315</span></span></div>
+        <div><span class="cm">$</span> <span class="ok">syntroph is alive</span><span class="caret"></span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- EXPLAINER -->
+<section id="docs">
+  <div class="wrap">
+    <div class="reveal">
+      <div class="sec-tag" style="justify-content:center;">Syntrophy, the biology</div>
+      <h2 style="text-align:center;">One organism’s <span class="g">metabolic output</span> feeds the other.</h2>
+      <p class="sec-lead" style="text-align:center;margin:0 auto;">In biology, syntrophy is symbiosis where the waste of one life form becomes the fuel of another. Syntroph applies the same law to software agents.</p>
+    </div>
+    <div class="explainer-grid">
+      <div class="explain-copy reveal">
+        <div class="org-card">
+          <div class="tag">Metabolism · Context</div>
+          <h4>Every trace is biomass</h4>
+          <p>Each agent leaves behind context, search traces, plans and refactored code. Instead of burning that energy, Syntroph <span class="em">harvests it into shared memory</span>.</p>
+        </div>
+        <div class="org-card">
+          <div class="tag">Symbiosis · Continuity</div>
+          <h4>Excess becomes fuel</h4>
+          <p>What one agent produces — a resolved bug, a forged abstraction, a hard-won design decision — becomes <span class="em">living context</span> that nourishes every subsequent agent in the network.</p>
+        </div>
+        <div class="org-card">
+          <div class="tag">Evolution · Learning</div>
+          <h4>The whole system grows</h4>
+          <p>Your agents stop working in isolation. The graph remembers, adapts and compounds, so each session starts <span class="em">stronger than the last</span>.</p>
+        </div>
+      </div>
+      <div class="diagram reveal" aria-label="Syntrophy diagram">
+        <svg class="links" viewBox="0 0 460 460" fill="none">
+          <line x1="118" y1="118" x2="230" y2="230" stroke="#7dffb2" opacity="0.55"/>
+          <line x1="342" y1="118" x2="230" y2="230" stroke="#22d3ee" opacity="0.55"/>
+          <line x1="230" y1="342" x2="230" y2="230" stroke="#a855f7" opacity="0.55"/>
+        </svg>
+        <span class="pulse-node" style="left:118px;top:118px;transform:translate(-50%,-50%);"></span>
+        <span class="pulse-node" style="left:342px;top:118px;transform:translate(-50%,-50%);"></span>
+        <span class="pulse-node" style="left:230px;top:342px;transform:translate(-50%,-50%);"></span>
+
+        <div class="node agent a1">
+          <span class="ico"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3l7 4v10l-7 4-7-4V7z"/><path d="M12 7v4"/><circle cx="12" cy="13.5" r="1.4" fill="currentColor" stroke="none"/></svg></span>
+          Claude Code
+        </div>
+        <div class="node agent a2">
+          <span class="ico"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 2a10 10 0 100 20 10 10 0 000-20z"/><path d="M12 6l6 9H6z"/></svg></span>
+          Codex
+        </div>
+        <div class="node agent a3">
+          <span class="ico"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6h16M4 12h16M4 18h16"/></svg></span>
+          Antigravity CLI
+        </div>
+        <div class="node center">
+          <span class="ico"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3.4"/><path d="M12 3v5.6M12 15.4V21M3 12h5.6M15.4 12H21"/></svg></span>
+          Memory &amp; Code-Knowledge Graph
+          <small>shared · evolving · local</small>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FEATURES -->
+<section id="memory" style="background:linear-gradient(180deg,transparent,rgba(7,16,20,0.5),transparent);">
+  <div class="wrap">
+    <div class="reveal" style="text-align:center;">
+      <div class="sec-tag" style="justify-content:center;">Capabilities</div>
+      <h2>One <span class="g">living substrate</span> for every agent.</h2>
+      <p class="sec-lead" style="margin:0 auto;">Not another plugin. A nervous system your coding agents share.</p>
+    </div>
+    <div class="feat-grid stagger" id="featGrid">
+      <div class="feat">
+        <div class="f-ico"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 19V9m8 10V5m8 14V12"/><circle cx="4" cy="21" r="2"/><circle cx="12" cy="7" r="2"/><circle cx="20" cy="14" r="2"/></svg></div>
+        <div class="f-tag">01 · memory</div>
+        <h3>Shared Evolving Memory</h3>
+        <p>One continuous, versioned memory that persists across every agent, session and tool. Nothing worth remembering is ever lost.</p>
+      </div>
+      <div class="feat">
+        <div class="f-ico"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="6" cy="6" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="12" cy="18" r="2.4"/><path d="M8 6h8M6.8 8l3.5 8M17.2 8l-3.5 8"/></svg></div>
+        <div class="f-tag">02 · graph</div>
+        <h3>Code-Knowledge Graph</h3>
+        <p>Files, functions, decisions and their rationale linked as nodes and synapses — so agents navigate meaning, not just text.</p>
+      </div>
+      <div class="feat">
+        <div class="f-ico"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M10 6.5h4M6.5 10v4M17.5 10v.5M10 17.5h4" stroke-dasharray="2 3"/></svg></div>
+        <div class="f-tag">03 · orchestration</div>
+        <h3>Multi-Agent Orchestration</h3>
+        <p>Route work across Claude Code, Codex and Antigravity CLI — each doing what it does best, all feeding the same graph.</p>
+      </div>
+      <div class="feat">
+        <div class="f-ico"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 4v16M4 8h16M4 16h16" opacity="0.4"/><path d="M12 4a3 3 0 013 3v10a3 3 0 01-6 0V7a3 3 0 013-3z"/></svg></div>
+        <div class="f-tag">04 · continuity</div>
+        <h3>Context Continuity</h3>
+        <p>Agents wake up with full situational awareness. No more re-explaining your codebase to a stranger who "doesn't remember".</p>
+      </div>
+      <div class="feat">
+        <div class="f-ico"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><circle cx="12" cy="12" r="3"/><path d="M12 3v6m0 6v6"/></svg></div>
+        <div class="f-tag">05 · privacy</div>
+        <h3>Local-First / Private</h3>
+        <p>Your graph lives on your machine. Full context, zero exfiltration. The intelligence is yours — no third-party black box.</p>
+      </div>
+      <div class="feat">
+        <div class="f-ico"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M8 9l-3 3 3 3M16 9l3 3-3 3M13 6l-2 12"/></svg></div>
+        <div class="f-tag">06 · open</div>
+        <h3>Extensible &amp; Open Source</h3>
+        <p>MIT-licensed core with a plugin API for new agents, memory stores and graph backends. Built in public, improved by many.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- AGENTS -->
+<section id="agents">
+  <div class="wrap">
+    <div class="reveal" style="text-align:center;">
+      <div class="sec-tag" style="justify-content:center;">Orchestrated agents</div>
+      <h2>Three agents. <span class="g">One metabolism.</span></h2>
+      <p class="sec-lead" style="margin:0 auto;">Bring your favorite tools. Syntroph wires them into a shared, self-reinforcing knowledge loop.</p>
+    </div>
+    <div class="agents-row stagger" id="agentsRow">
+      <div class="agent-card cc">
+        <div class="ac-head">
+          <div class="ac-logo">CC</div>
+          <div><div class="ac-name">Claude Code</div><div class="ac-ver">terminal-native agent</div></div>
+        </div>
+        <ul>
+          <li>Carries long-lived memory across sessions</li>
+          <li>Persists architectural decisions to the graph</li>
+          <li>Starts every task fully contextualized</li>
+        </ul>
+        <div class="ac-syn">› synapse: session → graph → next session</div>
+      </div>
+      <div class="agent-card cx">
+        <div class="ac-head">
+          <div class="ac-logo">CX</div>
+          <div><div class="ac-name">Codex</div><div class="ac-ver">OpenAI coding agent</div></div>
+        </div>
+        <ul>
+          <li>Seeds the graph with search &amp; reasoning traces</li>
+          <li>Feeds exploration findings into shared memory</li>
+          <li>Learns from patterns other agents discovered</li>
+        </ul>
+        <div class="ac-syn">› synapse: trace → graph → broader context</div>
+      </div>
+      <div class="agent-card ag">
+        <div class="ac-head">
+          <div class="ac-logo" style="background:linear-gradient(135deg,var(--violet),#6366f1);box-shadow:0 0 20px rgba(168,85,247,0.3);">AG</div>
+          <div><div class="ac-name">Antigravity CLI</div><div class="ac-ver">autonomous agent CLI</div></div>
+        </div>
+        <ul>
+          <li>Consumes shared context for autonomous runs</li>
+          <li>Writes execution outcomes back to the graph</li>
+          <li>Syncs long-running work with the network</li>
+        </ul>
+        <div class="ac-syn">› synapse: autonomy → graph → shared intent</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CODE SAMPLE -->
+<section id="code" style="background:linear-gradient(180deg,transparent,rgba(7,16,20,0.5),transparent);">
+  <div class="wrap">
+    <div class="reveal" style="text-align:center;">
+      <div class="sec-tag" style="justify-content:center;">Configuration</div>
+      <h2>Wire them up in <span class="g">one file.</span></h2>
+      <p class="sec-lead" style="margin:0 auto;">Declare your agents, point them at a shared memory store, and let the graph evolve.</p>
+    </div>
+    <div class="code-wrap reveal">
+      <div class="code-head">
+        <span class="file">syntroph.config.ts</span>
+        <button class="copy-btn" id="copyBtn" onclick="copyCode()">⧉ Copy</button>
+      </div>
+      <div class="code-box">
+<pre><code><span class="ln"><span class="ln-num"> 1</span><span class="kw">import</span> { defineConfig } <span class="kw">from</span> <span class="st">"syntroph"</span>;</span>
+<span class="ln"><span class="ln-num"> 2</span></span>
+<span class="ln"><span class="ln-num"> 3</span><span class="kw">export default</span> defineConfig({</span>
+<span class="ln"><span class="ln-num"> 4</span>  memory: {</span>
+<span class="ln"><span class="ln-num"> 5</span>    store: <span class="st">"local-graph"</span>,        <span class="cm">// private, on-device</span></span>
+<span class="ln"><span class="ln-num"> 6</span>    evolve: <span class="fn">true</span>,               <span class="cm">// memory grows each run</span></span>
+<span class="ln"><span class="ln-num"> 7</span>    sync: [<span class="st">"claude"</span>, <span class="st">"codex"</span>, <span class="st">"antigravity"</span>],</span>
+<span class="ln"><span class="ln-num"> 8</span>  },</span>
+<span class="ln"><span class="ln-num"> 9</span></span>
+<span class="ln"><span class="ln-num">10</span>  agents: [</span>
+<span class="ln"><span class="ln-num">11</span>    { id: <span class="st">"claude"</span>,      tool: <span class="st">"claude"</span>,      role: <span class="st">"architect"</span> },</span>
+<span class="ln"><span class="ln-num">12</span>    { id: <span class="st">"codex"</span>,       tool: <span class="st">"codex"</span>,       role: <span class="st">"explorer"</span>  },</span>
+<span class="ln"><span class="ln-num">13</span>    { id: <span class="st">"antigravity"</span>, tool: <span class="st">"antigravity"</span>, role: <span class="st">"executor"</span> },</span>
+<span class="ln"><span class="ln-num">14</span>  ],</span>
+<span class="ln"><span class="ln-num">15</span></span>
+<span class="ln"><span class="ln-num">16</span>  graph: {</span>
+<span class="ln"><span class="ln-num">17</span>    seed: <span class="fn">true</span>,                    <span class="cm">// index codebase up front</span></span>
+<span class="ln"><span class="ln-num">18</span>    connect: <span class="st">"semantic"</span>,          <span class="cm">// link by meaning, not path</span></span>
+<span class="ln"><span class="ln-num">19</span>    prune: { staleAfterDays: <span class="nm">30</span> },</span>
+<span class="ln"><span class="ln-num">20</span>  },</span>
+<span class="ln"><span class="ln-num">21</span>});</span></code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CTA BAND -->
+<section class="cta-band" id="start">
+  <div class="wrap reveal">
+    <div class="sec-tag" style="justify-content:center;">Open source · Local-first · Agent-agnostic</div>
+    <h2>Let them <span class="g">feed each other.</span></h2>
+    <div class="cta-line"><span class="cm">$</span> npm i -g syntroph &nbsp;·&nbsp; <span class="cm">$</span> syntroph init <span class="t">›</span> 3 agents <span class="v">›</span> graph warm</div>
+    <div class="cta-buttons">
+      <a href="#start" class="btn btn-primary">Get started →</a>
+      <a href="#github" class="btn btn-ghost" target="_blank" rel="noopener noreferrer">⛭ github.com/syntroph</a>
+    </div>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer id="github">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a href="#top" class="logo" style="font-size:1.1rem;">
+          <svg width="26" height="26" viewBox="0 0 32 32" fill="none">
+            <circle cx="9" cy="16" r="6" stroke="#7dffb2" stroke-width="2" fill="rgba(125,255,178,0.12)"/>
+            <circle cx="23" cy="16" r="6" stroke="#22d3ee" stroke-width="2" fill="rgba(34,211,238,0.12)"/>
+            <circle cx="16" cy="16" r="2.4" fill="#fde68a"/>
+            <path d="M9 16 L16 16 L23 16" stroke="#fde68a" stroke-width="1.6" opacity="0.9"/>
+          </svg>
+          <span>Syntr<em>oph</em></span>
+        </a>
+        <p>Built on the idea that symbiosis beats isolation. Agents grow stronger when they feed each other — and so does your code.</p>
+      </div>
+      <div class="foot-col">
+        <h5>Product</h5>
+        <a href="#docs">Docs</a>
+        <a href="#agents">Agents</a>
+        <a href="#memory">Memory</a>
+        <a href="#code">Configuration</a>
+      </div>
+      <div class="foot-col">
+        <h5>Community</h5>
+        <a href="#github" target="_blank" rel="noopener noreferrer">GitHub</a>
+        <a href="#github" target="_blank" rel="noopener noreferrer">Discord</a>
+        <a href="#github" target="_blank" rel="noopener noreferrer">Changelog</a>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span class="mono">© 2025 Syntroph · MIT License</span>
+      <span class="mono">agents feed on context — <span style="color:var(--green);">syntrophy</span> &gt; isolation</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+/* ---------- drift particles background ---------- */
+(function(){
+  const cv=document.getElementById('drift');
+  const ctx=cv.getContext('2d');
+  let w,h,parts=[],rafs;
+  const reduced=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function resize(){w=cv.width=innerWidth;h=cv.height=innerHeight;}
+  resize();
+  function make(n){parts=[];for(let i=0;i<n;i++){parts.push({x:Math.random()*w,y:Math.random()*h,r:Math.random()*1.6+.4,vx:(Math.random()-.5)*.2,vy:(Math.random()-.5)*.2,c:Math.random()<.5?'125,255,178':'34,211,238'});}}
+  make(w<640?40:80);
+  function draw(){
+    ctx.clearRect(0,0,w,h);
+    for(const p of parts){
+      p.x+=p.vx;p.y+=p.vy;
+      if(p.x<0)p.x=w;if(p.x>w)p.x=0;if(p.y<0)p.y=h;if(p.y>h)p.y=0;
+      ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,7);
+      ctx.fillStyle='rgba('+p.c+',0.5)';ctx.fill();
+    }
+    rafs=requestAnimationFrame(draw);
+  }
+  if(!reduced){draw();}
+  addEventListener('resize',()=>{resize();make(w<640?40:80);});
+})();
+
+/* ---------- HERO: two neurons exchanging a glowing core ---------- */
+(function(){
+  const cv=document.getElementById('hero-canvas');
+  const ctx=cv.getContext('2d');
+  const reduced=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let w,h,dpr=Math.min(devicePixelRatio||1,2);
+  let t=0;
+  function resize(){w=cv.clientWidth;h=cv.clientHeight;cv.width=w*dpr;cv.height=h*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);}
+  resize();
+  addEventListener('resize',resize);
+
+  // organic wobble radius
+  function wob(amp,phase,f){return amp*(Math.sin(t*f+phase)*0.5+0.5);}
+
+  function bodyShape(cx,cy,baseR,phase){
+    const pts=[];const N=60;
+    for(let i=0;i<=N;i++){
+      const a=(i/N)*Math.PI*2;
+      const r=baseR*(1+0.09*Math.sin(a*5+t*0.8+phase)+0.06*Math.sin(a*9-t*1.3+phase*2));
+      pts.push([cx+Math.cos(a)*r,cy+Math.sin(a)*r]);
+    }
+    return pts;
+  }
+
+  function drawBody(pts,color,inner){
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0],pts[0][1]);
+    for(let i=1;i<pts.length;i++){
+      const a=pts[i],b=pts[(i+1)%pts.length];
+      const mx=(a[0]+b[0])/2,my=(a[1]+b[1])/2;
+      ctx.quadraticCurveTo(a[0],a[1],mx,my);
+    }
+    ctx.closePath();
+    ctx.shadowColor=color;ctx.shadowBlur=inner?30:46;
+    ctx.fillStyle=inner;
+    ctx.fill();
+    ctx.shadowBlur=0;
+  }
+
+  // tendril path from body toward core
+  function tendrilPath(cx,cy,angle,targetX,targetY,ctrlOffset){
+    const len=45;
+    const ex=cx+Math.cos(angle)*len;
+    const ey=cy+Math.sin(angle)*len;
+    // control point curves toward core with oscillation
+    const mx=(ex+targetX)/2+(Math.sin(t*0.6+angle)*18);
+    const my=(ey+targetY)/2-(Math.cos(t*0.6+angle)*12);
+    return {ex,ey,cx2:mx,cy2:my};
+  }
+
+  // point along a cubic bezier (0..1)
+  function bezPoint(t,p0,p1,p2,p3){
+    const u=1-t;
+    return {
+      x:u*u*u*p0.x+3*u*u*t*p1.x+3*u*t*t*p2.x+t*t*t*p3.x,
+      y:u*u*u*p0.y+3*u*u*t*p1.y+3*u*t*t*p2.y+t*t*t*p3.y
+    };
+  }
+
+  // particles along a straight-ish tendril
+  const particles=[];
+  for(let i=0;i<60;i++){particles.push({side:i%2,off:(i*7)%100,sp:.004+Math.random()*.003});}
+
+  function draw(){
+    ctx.clearRect(0,0,w,h);
+    const cx=w/2, cy=h*0.5;
+    const spread=Math.min(w*0.28,260);
+    const lx=cx-spread, rx=cx+spread;
+    const baseR=Math.min(w*0.14,92);
+
+    const green='125,255,178', teal='34,211,238', amber='253,230,138';
+
+    // ambient bloom behind core
+    const pulse=0.5+0.5*Math.sin(t*1.4);
+    let g=ctx.createRadialGradient(cx,cy,0,cx,cy,baseR*1.8);
+    g.addColorStop(0,'rgba(253,230,138,'+(0.28+0.12*pulse)+')');
+    g.addColorStop(0.5,'rgba(253,230,138,0.06)');
+    g.addColorStop(1,'rgba(253,230,138,0)');
+    ctx.fillStyle=g;ctx.fillRect(0,0,w,h);
+
+    // left body
+    const lp=bodyShape(lx,cy+wob(14,0,1),baseR*0.7,0);
+    drawBody(lp,green,'rgba(6,26,20,0.85)');
+    // inner nucleus
+    const lpIn=bodyShape(lx,cy+wob(14,0,1),baseR*0.26,2);
+    drawBody(lpIn,green,'rgba(125,255,178,0.9)');
+
+    // right body
+    const rp=bodyShape(rx,cy+wob(14,3,1),baseR*0.7,Math.PI);
+    drawBody(rp,teal,'rgba(8,22,30,0.85)');
+    const rpIn=bodyShape(rx,cy+wob(14,3,1),baseR*0.26,5);
+    drawBody(rpIn,teal,'rgba(34,211,238,0.9)');
+
+    // tendrils from each body toward core
+    const tendrils=[];
+    for(let k=0;k<6;k++){
+      const ang=-Math.PI/2+ (k-2.5)*0.22 + wob(0.15,k,0.5);
+      const side = k<3?0:1;
+      const sx = side===0? lx:rx;
+      const col = side===0? green:teal;
+      const p0={x:sx,y:cy+wob(14,side?3:0,1)};
+      const len=Math.hypot(cx-p0.x,cy-p0.y)*0.6;
+      const p1={x:p0.x+Math.cos(ang)*len, y:p0.y+Math.sin(ang)*len};
+      const p2={x:cx-Math.cos(ang)*len*0.4, y:cy-Math.sin(ang)*len*0.4};
+      const p3={x:cx,y:cy};
+      tendrils.push({p0,p1,p2,p3,col,side});
+      // draw tendril
+      ctx.beginPath();
+      ctx.moveTo(p0.x,p0.y);
+      ctx.bezierCurveTo(p1.x,p1.y,p2.x,p2.y,p3.x,p3.y);
+      ctx.strokeStyle='rgba('+col+',0.5)';
+      ctx.lineWidth=1.4;
+      ctx.shadowColor='rgba('+col+',0.8)';ctx.shadowBlur=10;
+      ctx.stroke();
+      ctx.shadowBlur=0;
+      // node on tendril
+      const nn=bezPoint(0.5+0.15*Math.sin(t*0.7+k),p0,p1,p2,p3);
+      ctx.beginPath();ctx.arc(nn.x,nn.y,2.4,0,7);
+      ctx.fillStyle='rgba('+col+',0.9)';
+      ctx.shadowColor='rgba('+col+',1)';ctx.shadowBlur=8;
+      ctx.fill();ctx.shadowBlur=0;
+    }
+
+    // traveling particles along tendrils
+    for(let i=0;i<particles.length;i++){
+      const p=particles[i];
+      const td=tendrils[p.side % tendrils.length];
+      if(!td)continue;
+      const prog=((p.off/100)+(t*p.sp))%1;
+      const pt=bezPoint(prog,td.p0,td.p1,td.p2,td.p3);
+      const alpha=(1-prog)*0.9+0.1;
+      ctx.beginPath();ctx.arc(pt.x,pt.y,1.6+prog*1.5,0,7);
+      ctx.fillStyle='rgba('+td.col+','+alpha+')';
+      ctx.shadowColor='rgba('+td.col+',1)';ctx.shadowBlur=8;
+      ctx.fill();ctx.shadowBlur=0;
+    }
+
+    // the glowing core — metabolic exchange
+    const coreR=baseR*0.16*(1+0.12*pulse);
+    let cg=ctx.createRadialGradient(cx,cy,0,cx,cy,coreR*3);
+    cg.addColorStop(0,'rgba(255,244,214,0.95)');
+    cg.addColorStop(0.25,'rgba(253,230,138,0.75)');
+    cg.addColorStop(0.6,'rgba(253,230,138,0.18)');
+    cg.addColorStop(1,'rgba(253,230,138,0)');
+    ctx.beginPath();ctx.arc(cx,cy,coreR*3,0,7);
+    ctx.fillStyle=cg;ctx.fill();
+
+    // core sphere
+    ctx.beginPath();ctx.arc(cx,cy,coreR,0,7);
+    ctx.fillStyle='rgba(255,250,230,0.95)';
+    ctx.shadowColor='rgba(253,230,138,1)';ctx.shadowBlur=38;
+    ctx.fill();
+    ctx.shadowBlur=0;
+
+    // inner hot center
+    ctx.beginPath();ctx.arc(cx,cy,coreR*0.45,0,7);
+    ctx.fillStyle='rgba(255,255,255,0.95)';
+    ctx.shadowColor='rgba(255,244,214,1)';ctx.shadowBlur=26;
+    ctx.fill();
+    ctx.shadowBlur=0;
+
+    // energy streaks orbiting core
+    for(let k=0;k<3;k++){
+      const a=t*0.8+k*2.09;
+      ctx.beginPath();
+      ctx.arc(cx,cy,coreR*1.7,a,a+1.2);
+      ctx.strokeStyle='rgba(253,230,138,0.5)';
+      ctx.lineWidth=1.6;
+      ctx.shadowColor='rgba(253,230,138,0.9)';ctx.shadowBlur=10;
+      ctx.stroke();ctx.shadowBlur=0;
+    }
+
+    t+=0.016;
+    requestAnimationFrame(draw);
+  }
+
+  if(reduced){
+    // static frame — draw once
+    t=0.25;draw();
+  } else {
+    draw();
+  }
+})();
+
+/* ---------- reveal on scroll ---------- */
+(function(){
+  const io=new IntersectionObserver((entries)=>{
+    entries.forEach(e=>{
+      if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target);}
+    });
+  },{threshold:0.14});
+  document.querySelectorAll('.reveal,.stagger').forEach(el=>io.observe(el));
+})();
+
+/* ---------- copy button ---------- */
+function copyCode(){
+  const code=document.querySelector('.code-box code').innerText;
+  navigator.clipboard.writeText(code).then(()=>{
+    const b=document.getElementById('copyBtn');
+    const old=b.textContent;
+    b.textContent='✓ Copied';
+    setTimeout(()=>b.textContent=old,1800);
+  }).catch(()=>{
+    // fallback
+    const b=document.getElementById('copyBtn');
+    b.textContent='Press Ctrl/Cmd+C';
+    setTimeout(()=>{b.textContent='⧉ Copy';},1800);
+  });
+}
+
+/* ---------- mobile menu ---------- */
+function toggleMenu(){document.getElementById('mobileMenu').classList.toggle('open');}
+</script>
+</body>
+</html>
