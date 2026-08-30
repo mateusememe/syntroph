@@ -2,6 +2,7 @@ package core
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 )
 
@@ -23,6 +25,47 @@ type Journal interface {
 	AppendEvent(context.Context, Event) error
 	AppendAttempt(context.Context, HandlerAttempt) error
 	ReadSaga(context.Context, string) ([]JournalRecord, error)
+}
+
+// ListSagas returns the saga identifiers represented by journal segments.
+// Segment names are content hashes, so the identifier is recovered from the
+// immutable records rather than inferred from a filename.
+func (j *SagaJournal) ListSagas(ctx context.Context) ([]string, error) {
+	entries, err := os.ReadDir(j.dir)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(j.dir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		for _, line := range bytes.Split(b, []byte{'\n'}) {
+			if len(bytes.TrimSpace(line)) == 0 {
+				continue
+			}
+			var r JournalRecord
+			if err := json.Unmarshal(line, &r); err != nil {
+				return nil, fmt.Errorf("journal record: %w", err)
+			}
+			if r.Event != nil {
+				seen[r.Event.SagaID] = true
+			}
+			if r.Attempt != nil {
+				seen[r.Attempt.SagaID] = true
+			}
+		}
+	}
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids, nil
 }
 
 // SagaJournal stores one append-only JSONL segment per saga.
