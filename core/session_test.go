@@ -60,6 +60,13 @@ func TestSessionCloseDifferentArtifactsAtSameCommitRemainDistinct(t *testing.T) 
 	}
 }
 
+func TestRenderSessionDiaryNormalizesRelatedWikiLinks(t *testing.T) {
+	content := RenderSessionDiary(SessionDiary{SessionID: "s", IdempotencyKey: "k", RepositoryID: "r", CommitSHA: "c", ArtifactHash: "h", CreatedAt: time.Now().UTC(), Title: "Diary", Summary: "summary", Related: []string{"prior-session", "[[already-linked]]"}})
+	if !strings.Contains(content, "related: [[already-linked]],[[prior-session]]") {
+		t.Fatalf("related links were not rendered as wikilinks: %s", content)
+	}
+}
+
 func TestParseMarkdownAndManualSummary(t *testing.T) {
 	a, err := ParseSessionArtifact([]byte("# Closing\n\nA useful summary.\n\n## Decisions\n- Use ports\n\n## Lessons\n- Retry explicitly"), ArtifactMarkdown)
 	if err != nil {

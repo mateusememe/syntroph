@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"github.com/mateusememe/syntroph/adapters/graphify"
+	"github.com/mateusememe/syntroph/adapters/storageadapter"
 	"github.com/mateusememe/syntroph/core"
+	"github.com/mateusememe/syntroph/storage"
 )
 
 func main() {
@@ -80,7 +82,7 @@ func run(args []string, out, errOut interface{ Write([]byte) (int, error) }) err
 		}
 		return nil
 	case "retry":
-		return retry(args[2:], j, out)
+		return retry(args[2:], j, journalDir, out)
 	case "resolve":
 		return resolve(args[2:], out)
 	default:
@@ -125,7 +127,8 @@ func closeSession(args []string, out, errOut interface{ Write([]byte) (int, erro
 		graph = local
 	}
 	formatValue := core.ArtifactFormat(strings.ToLower(*format))
-	diary, delivery, err := (core.SessionCloser{Memory: memory, Bus: bus, Graph: graph}).Close(context.Background(), core.SessionCloseRequest{RepositoryID: *repo, CommitSHA: *sha, Author: *author, Runtime: *runtime, Artifact: data, Format: formatValue, ManualSummary: *summary})
+	storagePort := configuredStorage(filepath.Join(*root, "config.json"))
+	diary, delivery, err := (core.SessionCloser{Memory: memory, Bus: bus, Graph: graph, Storage: storagePort}).Close(context.Background(), core.SessionCloseRequest{RepositoryID: *repo, CommitSHA: *sha, Author: *author, Runtime: *runtime, Artifact: data, Format: formatValue, ManualSummary: *summary})
 	if err != nil {
 		return err
 	}
@@ -149,7 +152,37 @@ func configuredString(path, key string) string {
 	return strings.TrimSpace(cfg[key])
 }
 
-func retry(args []string, journal *core.SagaJournal, out interface{ Write([]byte) (int, error) }) error {
+// configuredStorage keeps provider selection at the adapter boundary. A
+// missing authenticated client is represented as a pending mirror, never as
+// a silently skipped synchronization.
+func configuredStorage(path string) core.StoragePort {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var cfg struct {
+		Storage struct {
+			Backend string `json:"backend"`
+			GitHub  struct {
+				Provider   string `json:"provider"`
+				Repository string `json:"repository"`
+			} `json:"github"`
+		} `json:"storage"`
+	}
+	if json.Unmarshal(b, &cfg) != nil || cfg.Storage.Backend == "" {
+		return nil
+	}
+	backend := storage.Backend(cfg.Storage.Backend)
+	if backend != storage.BackendWiki && backend != storage.BackendIssues {
+		return nil
+	}
+	// Authentication/client construction is deliberately delegated to the
+	// configured provider. Until a local provider is installed, this adapter
+	// remains visible as StorageSyncPending and is recoverable.
+	return storageadapter.Adapter{Provider: nil}
+}
+
+func retry(args []string, journal *core.SagaJournal, journalDir string, out interface{ Write([]byte) (int, error) }) error {
 	fs := flag.NewFlagSet("sync retry", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	graph, storage := fs.Bool("graph", false, "retry graph obligations"), fs.Bool("storage", false, "retry storage obligations")
@@ -169,7 +202,7 @@ func retry(args []string, journal *core.SagaJournal, out interface{ Write([]byte
 	}
 	count := 0
 	for _, item := range items {
-		if (scope == "graph" && item.State != core.GraphResolutionPending && item.State != core.GraphSyncPending) || (scope == "storage" && item.State == core.GraphResolutionPending) {
+		if (scope == "graph" && item.State != core.GraphResolutionPending && item.State != core.GraphSyncPending) || (scope == "storage" && item.State != "StorageSyncPending") {
 			continue
 		}
 		e := core.Event{EventID: item.SagaID + ":retry:" + scope, Type: "sync.retry.requested", OccurredAt: time.Now().UTC(), RepositoryID: item.RepositoryID, SagaID: item.SagaID, CorrelationID: item.SagaID, CausationID: item.EventID, SchemaVersion: 1, Payload: []byte(fmt.Sprintf(`{"scope":%q}`, scope))}
@@ -187,10 +220,57 @@ func retry(args []string, journal *core.SagaJournal, out interface{ Write([]byte
 			if err := journal.AppendAttempt(context.Background(), core.HandlerAttempt{EventID: e.EventID, SagaID: item.SagaID, HandlerID: "graph-retry", AttemptedAt: time.Now().UTC(), Outcome: "succeeded"}); err != nil {
 				return err
 			}
+		} else {
+			if err := retryStorage(context.Background(), journal, journalDir, item); err != nil {
+				if appendErr := journal.AppendAttempt(context.Background(), core.HandlerAttempt{EventID: e.EventID, SagaID: item.SagaID, HandlerID: "storage-retry", AttemptedAt: time.Now().UTC(), Outcome: "failed", Error: err.Error()}); appendErr != nil {
+					return appendErr
+				}
+				continue
+			}
+			if err := journal.AppendAttempt(context.Background(), core.HandlerAttempt{EventID: e.EventID, SagaID: item.SagaID, HandlerID: "storage-retry", AttemptedAt: time.Now().UTC(), Outcome: "succeeded"}); err != nil {
+				return err
+			}
+			_ = journal.AppendEvent(context.Background(), core.Event{EventID: item.SagaID + ":storage-succeeded", Type: "storage.sync.succeeded", OccurredAt: time.Now().UTC(), RepositoryID: item.RepositoryID, SagaID: item.SagaID, CorrelationID: item.SagaID, CausationID: e.EventID, SchemaVersion: 1, Payload: []byte(`{"state":"mirrored"}`)})
 		}
 		count++
 	}
 	fmt.Fprintf(out, "Retry requested for %s synchronization for %d saga(s). External effects require the configured adapter.\n", scope, count)
+	return nil
+}
+
+func diaryFromSaga(ctx context.Context, journal *core.SagaJournal, saga string) (core.SessionDiary, error) {
+	records, err := journal.ReadSaga(ctx, saga)
+	if err != nil {
+		return core.SessionDiary{}, err
+	}
+	for _, r := range records {
+		if r.Event != nil && r.Event.Type == "session.closed" {
+			var d core.SessionDiary
+			if json.Unmarshal(r.Event.Payload, &d) == nil {
+				return d, nil
+			}
+		}
+	}
+	return core.SessionDiary{}, errors.New("session diary not found in saga journal")
+}
+
+func retryStorage(ctx context.Context, journal *core.SagaJournal, journalDir string, item core.RecoveryItem) error {
+	diary, err := diaryFromSaga(ctx, journal, item.SagaID)
+	if err != nil {
+		return err
+	}
+	port := configuredStorage(filepath.Join(filepath.Dir(filepath.Dir(journalDir)), "config.json"))
+	resolver, ok := port.(core.EventAwareStoragePort)
+	if !ok || resolver == nil {
+		return errors.New("storage adapter is not configured")
+	}
+	r := resolver.MirrorEvent(ctx, item.SagaID+":storage-retry", diary)
+	if r.State != "mirrored" {
+		if r.Cause != nil {
+			return r.Cause
+		}
+		return errors.New("storage synchronization remains pending")
+	}
 	return nil
 }
 
@@ -226,6 +306,7 @@ func resolve(args []string, out interface{ Write([]byte) (int, error) }) error {
 	fs := flag.NewFlagSet("sync resolve", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	local, remote, keepLocal, keepRemote := fs.String("local-file", "", "local canonical content"), fs.String("remote-file", "", "remote content observed"), fs.Bool("keep-local", false, "overwrite remote with local content"), fs.Bool("keep-remote", false, "acknowledge remote content")
+	revision, root := fs.String("revision", "", "remote revision observed during diff"), fs.String("root", ".syntroph", "Syntroph data root")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -234,6 +315,36 @@ func resolve(args []string, out interface{ Write([]byte) (int, error) }) error {
 	}
 	if *keepLocal == *keepRemote {
 		return errors.New("sync resolve requires exactly one of --keep-local or --keep-remote")
+	}
+	// With an adapter configured, resolve the immutable diary through the
+	// provider-neutral StoragePort and require the observed remote revision.
+	if *local == "" && *remote == "" {
+		journal, err := core.NewSagaJournal(filepath.Join(*root, "journal"))
+		if err != nil {
+			return err
+		}
+		diary, err := diaryFromSaga(context.Background(), journal, fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		port := configuredStorage(filepath.Join(*root, "config.json"))
+		resolver, ok := port.(core.StorageResolver)
+		if !ok || resolver == nil {
+			return errors.New("sync resolve requires --local-file and --remote-file, or a configured storage adapter")
+		}
+		if *revision == "" {
+			return errors.New("sync resolve requires --revision for remote validation")
+		}
+		r := resolver.Resolve(context.Background(), diary, map[bool]string{true: "keep-local", false: "keep-remote"}[*keepLocal], *revision)
+		if r.State != "mirrored" {
+			if r.Cause != nil {
+				return r.Cause
+			}
+			return errors.New("storage conflict remains unresolved")
+		}
+		_ = journal.AppendEvent(context.Background(), core.Event{EventID: fs.Arg(0) + ":storage-resolved", Type: "storage.sync.resolved", OccurredAt: time.Now().UTC(), RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: fs.Arg(0), SchemaVersion: 1, Payload: []byte(`{"state":"mirrored"}`)})
+		fmt.Fprintf(out, "Resolution recorded: %s.\n", map[bool]string{true: "keep-local", false: "keep-remote"}[*keepLocal])
+		return nil
 	}
 	if *local == "" || *remote == "" {
 		return errors.New("sync resolve requires --local-file and --remote-file to display a diff")

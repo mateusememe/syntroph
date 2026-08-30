@@ -49,8 +49,15 @@ func InspectRecovery(ctx context.Context, journal *SagaJournal) ([]RecoveryItem,
 		for _, record := range records {
 			if record.Event != nil {
 				item.EventID, item.RepositoryID = record.Event.EventID, record.Event.RepositoryID
+				if record.Event.Type == "storage.sync.resolved" || record.Event.Type == "storage.sync.succeeded" {
+					item.State, item.NextAction = "Succeeded", "none"
+					continue
+				}
+				if record.Event.Type == "storage.sync.pending" {
+					item.State, item.NextAction = "StorageSyncPending", "syntroph sync retry --storage"
+				}
 				var diary SessionDiary
-				if json.Unmarshal(record.Event.Payload, &diary) == nil {
+				if record.Event.Type == "session.closed" && json.Unmarshal(record.Event.Payload, &diary) == nil {
 					switch diary.GraphState {
 					case GraphResolutionPending:
 						item.State, item.NextAction = GraphResolutionPending, "syntroph sync retry --graph"

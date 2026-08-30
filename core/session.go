@@ -185,6 +185,10 @@ type EventAwareStoragePort interface {
 	MirrorEvent(context.Context, string, SessionDiary) StorageResult
 }
 
+type StorageResolver interface {
+	Resolve(context.Context, SessionDiary, string, string) StorageResult
+}
+
 type StorageResult struct {
 	EventID     string
 	State       string
@@ -370,6 +374,9 @@ func RenderSessionDiary(d SessionDiary) string {
 	refs, _ := json.Marshal(d.CodeReferences)
 	related := append([]string(nil), d.Related...)
 	sort.Strings(related)
+	for i := range related {
+		related[i] = wikilink(related[i])
+	}
 	metadata, _ := json.Marshal(d)
 	var sections strings.Builder
 	sections.WriteString(d.Summary + "\n")
@@ -392,6 +399,14 @@ func RenderSessionDiary(d SessionDiary) string {
 		}
 	}
 	return fmt.Sprintf("---\nsession_id: %s\nidempotency_key: %s\nrepository_id: %s\ncommit_sha: %s\nartifact_hash: %s\nauthor: %s\nruntime: %s\ncreated_at: %s\ntitle: %s\ncode_references: %s\nrelated: %s\n---\n\n<!-- syntroph-metadata\n%s\n-->\n\n# %s\n\n%s", d.SessionID, d.IdempotencyKey, d.RepositoryID, d.CommitSHA, d.ArtifactHash, d.Author, d.Runtime, d.CreatedAt.Format(time.RFC3339Nano), d.Title, refs, strings.Join(related, ","), metadata, d.Title, sections.String())
+}
+
+func wikilink(value string) string {
+	v := strings.TrimSpace(value)
+	if strings.HasPrefix(v, "[[") && strings.HasSuffix(v, "]]") {
+		return v
+	}
+	return "[[" + strings.Trim(v, "[]") + "]]"
 }
 
 func renderDiary(d SessionDiary) string { return RenderSessionDiary(d) }

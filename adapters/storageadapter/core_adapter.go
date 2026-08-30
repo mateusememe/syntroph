@@ -20,5 +20,13 @@ func (a Adapter) MirrorEvent(ctx context.Context, eventID string, d core.Session
 	return core.StorageResult{EventID: eventID, State: string(r.State), Backend: string(r.Backend), Key: r.Key, RemoteID: r.RemoteID, RemoteRev: r.RemoteRev, ExpectedRev: r.ExpectedRev, Cause: r.Cause}
 }
 
+func (a Adapter) Resolve(ctx context.Context, d core.SessionDiary, choice, observedRevision string) core.StorageResult {
+	if a.Provider == nil {
+		return core.StorageResult{State: string(storage.StorageSyncPending), Cause: storage.ErrUnavailable}
+	}
+	r := a.Provider.Resolve(ctx, storage.SessionDiary{SessionID: d.SessionID, RepositoryID: d.RepositoryID, CommitSHA: d.CommitSHA, ArtifactHash: d.ArtifactHash, Content: core.RenderSessionDiary(d)}, storage.Resolution(choice), observedRevision)
+	return core.StorageResult{State: string(r.State), Backend: string(r.Backend), Key: r.Key, RemoteID: r.RemoteID, RemoteRev: r.RemoteRev, ExpectedRev: r.ExpectedRev, Cause: r.Cause}
+}
+
 var _ core.StoragePort = Adapter{}
 var _ core.EventAwareStoragePort = Adapter{}
