@@ -95,11 +95,11 @@ func TestResolveRequiresObservedRevisionAndExplicitChoice(t *testing.T) {
 }
 
 func TestCredentialProvidersStayBehindAuthenticatedClientBoundary(t *testing.T) {
-	old := os.Getenv("SYNTROPH_TEST_TOKEN")
-	defer os.Setenv("SYNTROPH_TEST_TOKEN", old)
-	os.Setenv("SYNTROPH_TEST_TOKEN", "secret")
+	old := os.Getenv(GitHubTokenEnvironment)
+	defer os.Setenv(GitHubTokenEnvironment, old)
+	os.Setenv(GitHubTokenEnvironment, "secret")
 	want := &fakeClient{docs: map[string]RemoteDocument{}}
-	p := EnvTokenProvider{TokenEnv: "SYNTROPH_TEST_TOKEN", Factory: func(token string) (GitHubClient, error) {
+	p := GitHubTokenProvider{Factory: func(token string) (GitHubClient, error) {
 		if token != "secret" {
 			t.Fatal("wrong token")
 		}
@@ -109,7 +109,8 @@ func TestCredentialProvidersStayBehindAuthenticatedClientBoundary(t *testing.T) 
 	if err != nil || got != want {
 		t.Fatalf("provider: %v", err)
 	}
-	if _, err := (EnvTokenProvider{TokenEnv: "MISSING", Factory: func(string) (GitHubClient, error) { return want, nil }}).Client(context.Background()); err == nil {
+	os.Unsetenv(GitHubTokenEnvironment)
+	if _, err := (GitHubTokenProvider{Factory: func(string) (GitHubClient, error) { return want, nil }}).Client(context.Background()); err == nil {
 		t.Fatal("missing token should fail")
 	}
 	mcp := MCPProvider{ClientFactory: func(context.Context) (GitHubClient, error) { return want, nil }}

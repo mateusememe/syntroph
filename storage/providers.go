@@ -6,31 +6,25 @@ import (
 	"os"
 )
 
-type Provider string
-
-const (
-	ProviderEnvToken Provider = "env-token"
-	ProviderMCP      Provider = "mcp"
-)
+const GitHubTokenEnvironment = "SYNTROPH_GITHUB_TOKEN"
 
 // CredentialProvider is deliberately opaque: adapters receive an authenticated
-// client, while this boundary lets configuration select env-token or MCP.
+// client while credentials remain owned by the selected transport.
 type CredentialProvider interface {
 	Client(context.Context) (GitHubClient, error)
 }
 
-type EnvTokenProvider struct {
-	TokenEnv string
-	Factory  func(string) (GitHubClient, error)
+type GitHubTokenProvider struct {
+	Factory func(string) (GitHubClient, error)
 }
 
-func (p EnvTokenProvider) Client(ctx context.Context) (GitHubClient, error) {
-	if p.TokenEnv == "" || p.Factory == nil {
-		return nil, errors.New("env-token provider requires token_env and factory")
+func (p GitHubTokenProvider) Client(ctx context.Context) (GitHubClient, error) {
+	if p.Factory == nil {
+		return nil, errors.New("GitHub token provider requires a client factory")
 	}
-	token := os.Getenv(p.TokenEnv)
+	token := os.Getenv(GitHubTokenEnvironment)
 	if token == "" {
-		return nil, errors.New("configured GitHub token environment variable is empty")
+		return nil, errors.New("SYNTROPH_GITHUB_TOKEN is empty")
 	}
 	return p.Factory(token)
 }

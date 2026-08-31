@@ -2,12 +2,33 @@ package core
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+type preflightStorage struct {
+	ready       bool
+	mirrorCalls int
+}
+
+func (s *preflightStorage) Preflight(context.Context) StoragePreflightResult {
+	if s.ready {
+		return StoragePreflightResult{Ready: true, Backend: "issues", Provider: "github-rest", Repository: "mateusememe/syntroph"}
+	}
+	return StoragePreflightResult{
+		Backend: "issues", Provider: "github-rest", Repository: "mateusememe/syntroph",
+		Cause: errors.New("SYNTROPH_GITHUB_TOKEN is not set"),
+	}
+}
+
+func (s *preflightStorage) Mirror(context.Context, SessionDiary) StorageResult {
+	s.mirrorCalls++
+	return StorageResult{State: "mirrored"}
+}
 
 func TestSessionCloseWritesImmutableDiaryAndIsIdempotent(t *testing.T) {
 	store := LocalMemoryStore{Root: filepath.Join(t.TempDir(), ".syntroph", "memory")}
@@ -78,5 +99,43 @@ func TestParseMarkdownAndManualSummary(t *testing.T) {
 	m, err := ManualSessionArtifact("manual summary")
 	if err != nil || m.Summary != "manual summary" {
 		t.Fatalf("unexpected manual artifact: %#v %v", m, err)
+	}
+}
+
+func TestSessionClosePersistsDiaryAndPrerequisiteBeforeSkippingMirror(t *testing.T) {
+	root := t.TempDir()
+	journal, err := NewSagaJournal(filepath.Join(root, "journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus, err := NewEventBus(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &preflightStorage{}
+	store := LocalMemoryStore{Root: filepath.Join(root, "memory")}
+	diary, _, err := (SessionCloser{Memory: store, Bus: bus, Storage: remote}).Close(context.Background(), SessionCloseRequest{
+		RepositoryID: "github.com/mateusememe/syntroph", CommitSHA: "abc123", Author: "matt",
+		Format: ArtifactJSON, Artifact: []byte(`{"summary":"safe preflight"}`),
+	})
+	if err != nil {
+		t.Fatalf("missing remote prerequisite failed local close: %v", err)
+	}
+	if remote.mirrorCalls != 0 {
+		t.Fatalf("preflight failure performed %d provider writes", remote.mirrorCalls)
+	}
+	if _, ok, err := store.FindByIdempotencyKey(context.Background(), diary.IdempotencyKey); err != nil || !ok {
+		t.Fatalf("durable local diary missing: ok=%v err=%v", ok, err)
+	}
+	records, err := journal.ReadSaga(context.Background(), diary.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 3 || records[0].Event == nil || records[0].Event.Type != "session.closed" || records[2].Event == nil || records[2].Event.Type != "storage.prerequisite.missing" {
+		t.Fatalf("unexpected durable preflight sequence: %+v", records)
+	}
+	items, err := InspectRecovery(context.Background(), journal)
+	if err != nil || len(items) != 1 || items[0].State != "StoragePrerequisiteMissing" || items[0].NextAction != "syntroph doctor storage" {
+		t.Fatalf("unexpected recovery view: %+v err=%v", items, err)
 	}
 }

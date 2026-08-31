@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/mateusememe/syntroph/adapters/graphify"
-	"github.com/mateusememe/syntroph/adapters/storageadapter"
 	"github.com/mateusememe/syntroph/core"
 	"github.com/mateusememe/syntroph/storage"
 )
@@ -28,13 +27,16 @@ func main() {
 
 func run(args []string, out, errOut interface{ Write([]byte) (int, error) }) error {
 	if len(args) < 2 {
-		return errors.New("usage: syntroph session close | sync <status|recovery|retry|resolve>")
+		return errors.New("usage: syntroph session close | doctor storage | sync <status|recovery|retry|resolve>")
 	}
 	if args[0] == "session" && args[1] == "close" {
 		return closeSession(args[2:], out, errOut)
 	}
+	if args[0] == "doctor" && args[1] == "storage" {
+		return doctorStorage(args[2:], out, errOut)
+	}
 	if args[0] != "sync" {
-		return errors.New("usage: syntroph session close | sync <status|recovery|retry|resolve>")
+		return errors.New("usage: syntroph session close | doctor storage | sync <status|recovery|retry|resolve>")
 	}
 	journalDir := filepath.Join(".syntroph", "journal")
 	if len(args) >= 3 && strings.HasPrefix(args[1], "--journal=") {
@@ -140,15 +142,15 @@ func closeSession(args []string, out, errOut interface{ Write([]byte) (int, erro
 	}
 	memory := core.LocalMemoryStore{Root: filepath.Join(*root, "memory")}
 	// LocalGraphPort is the deterministic default. Set graphify_executable in
-	// .syntroph/config.json to exercise the optional real adapter.
+	// .syntroph/config.yaml to exercise the optional real adapter.
 	var graph core.GraphPort
-	if executable := configuredString(filepath.Join(*root, "config.json"), "graphify_executable"); executable != "" {
+	if executable := configuredGraphExecutable(*root); executable != "" {
 		graph = graphify.New(executable)
 	} else if local, e := core.NewLocalGraphPort(filepath.Join(*root, "graph")); e == nil {
 		graph = local
 	}
 	formatValue := core.ArtifactFormat(strings.ToLower(*format))
-	storagePort := configuredStorage(filepath.Join(*root, "config.json"))
+	storagePort := configuredStorage(*root, filepath.Dir(*root))
 	diary, delivery, err := (core.SessionCloser{Memory: memory, Bus: bus, Graph: graph, Storage: storagePort}).Close(context.Background(), core.SessionCloseRequest{RepositoryID: *repo, CommitSHA: *sha, Author: *author, Runtime: *runtime, Artifact: data, Format: formatValue, ManualSummary: *summary})
 	if err != nil {
 		return err
@@ -159,48 +161,6 @@ func closeSession(args []string, out, errOut interface{ Write([]byte) (int, erro
 	}{diary, delivery}, "", "  ")
 	_, _ = out.Write(append(b, '\n'))
 	return nil
-}
-
-func configuredString(path, key string) string {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	var cfg map[string]string
-	if json.Unmarshal(b, &cfg) != nil {
-		return ""
-	}
-	return strings.TrimSpace(cfg[key])
-}
-
-// configuredStorage keeps provider selection at the adapter boundary. A
-// missing authenticated client is represented as a pending mirror, never as
-// a silently skipped synchronization.
-func configuredStorage(path string) core.StoragePort {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	var cfg struct {
-		Storage struct {
-			Backend string `json:"backend"`
-			GitHub  struct {
-				Provider   string `json:"provider"`
-				Repository string `json:"repository"`
-			} `json:"github"`
-		} `json:"storage"`
-	}
-	if json.Unmarshal(b, &cfg) != nil || cfg.Storage.Backend == "" {
-		return nil
-	}
-	backend := storage.Backend(cfg.Storage.Backend)
-	if backend != storage.BackendWiki && backend != storage.BackendIssues {
-		return nil
-	}
-	// Authentication/client construction is deliberately delegated to the
-	// configured provider. Until a local provider is installed, this adapter
-	// remains visible as StorageSyncPending and is recoverable.
-	return storageadapter.Adapter{Provider: nil}
 }
 
 func retry(args []string, journal *core.SagaJournal, journalDir string, out interface{ Write([]byte) (int, error) }) error {
@@ -280,7 +240,8 @@ func retryStorage(ctx context.Context, journal *core.SagaJournal, journalDir str
 	if err != nil {
 		return err
 	}
-	port := configuredStorage(filepath.Join(filepath.Dir(filepath.Dir(journalDir)), "config.json"))
+	syntrophRoot := filepath.Dir(journalDir)
+	port := configuredStorage(syntrophRoot, filepath.Dir(syntrophRoot))
 	resolver, ok := port.(core.EventAwareStoragePort)
 	if !ok || resolver == nil {
 		return errors.New("storage adapter is not configured")
@@ -348,7 +309,7 @@ func resolve(args []string, out interface{ Write([]byte) (int, error) }) error {
 		if err != nil {
 			return err
 		}
-		port := configuredStorage(filepath.Join(*root, "config.json"))
+		port := configuredStorage(*root, filepath.Dir(*root))
 		resolver, ok := port.(core.StorageResolver)
 		if !ok || resolver == nil {
 			return errors.New("sync resolve requires --local-file and --remote-file, or a configured storage adapter")

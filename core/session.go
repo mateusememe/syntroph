@@ -179,6 +179,30 @@ type StoragePort interface {
 	Mirror(context.Context, SessionDiary) StorageResult
 }
 
+// StoragePreflightPort exposes the same non-mutating prerequisite check used
+// by `syntroph doctor storage`. Session close invokes it only after the local
+// diary and session.closed event are durable.
+type StoragePreflightPort interface {
+	Preflight(context.Context) StoragePreflightResult
+}
+
+type StoragePreflightCheck struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Detail string `json:"detail"`
+	Action string `json:"action,omitempty"`
+}
+
+type StoragePreflightResult struct {
+	Enabled    bool                    `json:"enabled"`
+	Ready      bool                    `json:"ready"`
+	Backend    string                  `json:"backend,omitempty"`
+	Provider   string                  `json:"provider,omitempty"`
+	Repository string                  `json:"repository,omitempty"`
+	Checks     []StoragePreflightCheck `json:"checks,omitempty"`
+	Cause      error                   `json:"-"`
+}
+
 // EventAwareStoragePort lets external mirrors use the immutable event ID as
 // their idempotency key while retaining the diary's artifact key.
 type EventAwareStoragePort interface {
@@ -275,7 +299,13 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 	e := Event{EventID: diary.SessionID, Type: "session.closed", OccurredAt: now, RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, SchemaVersion: 1, Payload: payload}
 	if c.Bus == nil {
 		if c.Storage != nil {
-			_ = c.Storage.Mirror(ctx, diary)
+			ready := true
+			if preflight, ok := c.Storage.(StoragePreflightPort); ok {
+				ready = preflight.Preflight(ctx).Ready
+			}
+			if ready {
+				_ = c.Storage.Mirror(ctx, diary)
+			}
 		}
 		return diary, Delivery{EventID: diary.SessionID}, nil
 	}
@@ -289,11 +319,29 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 	// should replay storage automatically.
 	storageEventID := diary.SessionID + ":storage"
 	var storageResult StorageResult
-	if mirror, ok := c.Storage.(EventAwareStoragePort); ok {
-		storageResult = mirror.MirrorEvent(ctx, storageEventID, diary)
-	} else {
-		storageResult = c.Storage.Mirror(ctx, diary)
-		storageResult.EventID = storageEventID
+	preflightReady := true
+	if preflight, ok := c.Storage.(StoragePreflightPort); ok {
+		check := preflight.Preflight(ctx)
+		preflightReady = check.Ready
+		if !check.Ready {
+			cause := check.Cause
+			if cause == nil {
+				cause = errors.New("storage prerequisites are missing")
+			}
+			storageResult = StorageResult{
+				EventID: storageEventID, State: "StoragePrerequisiteMissing",
+				Backend: check.Backend, Provider: check.Provider,
+				FailureClass: "prerequisite_missing", Error: cause.Error(), Cause: cause,
+			}
+		}
+	}
+	if preflightReady {
+		if mirror, ok := c.Storage.(EventAwareStoragePort); ok {
+			storageResult = mirror.MirrorEvent(ctx, storageEventID, diary)
+		} else {
+			storageResult = c.Storage.Mirror(ctx, diary)
+			storageResult.EventID = storageEventID
+		}
 	}
 	if storageResult.Cause != nil && storageResult.Error == "" {
 		storageResult.Error = storageResult.Cause.Error()

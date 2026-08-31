@@ -18,7 +18,7 @@ Syntroph is a Go toolkit and orchestrator that connects open-source development 
 
 - Go hexagonal core, synchronous in-process Event Bus, and append-only Saga Journal.
 - MVP: MemoryPort + GraphPort with canonical local storage under `.syntroph/memory/`.
-- GitHub Wiki or Issues as StoragePort mirrors, using external `env-token` or `mcp` credential providers.
+- GitHub Wiki or Issues as StoragePort mirrors, with exactly one explicit `github-rest`, `github-mcp`, or `github-wiki-git` provider.
 - Claude Code, Codex, and Antigravity CLI runtimes. KiroCrew is design inspiration only.
 - Explicit recovery with `sync status`, `sync recovery`, `sync retry`, and conflict resolution.
 
@@ -28,6 +28,7 @@ See [CONTEXT.md](CONTEXT.md), [architecture decisions](docs/adr/), and [brainsto
 
 ```sh
 syntroph session close --artifact session.md --repository owner/name --commit <sha>
+syntroph doctor storage
 syntroph sync status
 syntroph sync recovery
 syntroph sync retry --graph
@@ -35,6 +36,8 @@ syntroph sync resolve <id> --keep-local
 ```
 
 Session artifacts are structured Markdown or JSON. A manual `--summary` fallback is supported; raw transcript capture is outside the MVP.
+
+Repository configuration uses `.syntroph/config.yaml` exclusively. Run `syntroph doctor storage` after cloning to validate the selected provider, normalized destination, and local prerequisites without authenticating or writing remotely. See [Installation](INSTALL.md#github-mirroring) for safe examples.
 
 ## Selected engineering skills
 
