@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mateusememe/syntroph/core"
+	"github.com/mateusememe/syntroph/storage"
 )
 
 func TestSyncRecoveryIsReadOnlyAndExplainsExplicitRetry(t *testing.T) {
@@ -61,5 +62,53 @@ func TestSyncResolveShowsDiffAndRequiresExplicitChoice(t *testing.T) {
 	b, _ := os.ReadFile(remote)
 	if string(b) != "remote\n" {
 		t.Fatal("keep-remote changed remote content")
+	}
+}
+
+func TestSyncRecoveryShowsRemoteEvidenceAndClearsOnlyVerifiedOrphanLock(t *testing.T) {
+	root := t.TempDir()
+	journalDir := filepath.Join(root, "journal")
+	journal, err := core.NewSagaJournal(journalDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := strings.Repeat("a", 64)
+	payload, _ := json.Marshal(core.StorageResult{
+		State: "StorageSyncConflict", Backend: "issues", Provider: "fake-issues", Key: key,
+		RemoteID: "42", RemoteURL: "https://example.test/issues/42",
+		RemoteRev:    "issue:42:2026-08-31T00:00:00Z:" + strings.Repeat("b", 64),
+		FailureClass: "conflict", ConflictSnapshot: filepath.Join(root, "storage", "conflicts", key, "remote.md"), Error: "remote diverged",
+	})
+	if err := journal.AppendEvent(context.Background(), core.Event{EventID: "s:storage", Type: "storage.sync.conflict", OccurredAt: time.Now().UTC(), RepositoryID: "r", SagaID: "s", CorrelationID: "s", SchemaVersion: 1, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := run([]string{"sync", "--journal=" + journalDir, "recovery"}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"fake-issues", "issues/42", "issue:42", "conflict", "remote.md", "sync resolve s"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("recovery output missing %q: %s", want, out.String())
+		}
+	}
+
+	locks, err := storage.NewMirrorLocks(filepath.Join(root, "storage"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockDir := filepath.Join(root, "storage", "locks")
+	owner, _ := json.Marshal(storage.MirrorLockOwner{PID: 999999, StartedAt: time.Now().Add(-time.Hour).UTC(), OwnerID: "orphan-owner"})
+	if err := os.WriteFile(filepath.Join(lockDir, key+".lock"), owner, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"sync", "--journal=" + journalDir, "recovery", "--clear-lock", key, "--root", root}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "No external effect") {
+		t.Fatalf("orphan cleanup output: %s", out.String())
+	}
+	if _, ok, err := locks.Owner(context.Background(), key); err != nil || ok {
+		t.Fatalf("orphan lock remains: ok=%v err=%v", ok, err)
 	}
 }

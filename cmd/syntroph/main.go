@@ -57,10 +57,31 @@ func run(args []string, out, errOut interface{ Write([]byte) (int, error) }) err
 			return nil
 		}
 		for _, item := range items {
-			fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", item.SagaID, item.State, item.LastError, item.NextAction)
+			fmt.Fprintf(out, "%s\t%s\tprovider=%s\tremote=%s\trevision=%s\tfailure=%s\tevidence=%s\terror=%s\tnext=%s\n", item.SagaID, item.State, item.Provider, item.RemoteID, item.RemoteRevision, item.FailureClass, item.ConflictSnapshot, item.LastError, item.NextAction)
 		}
 		return nil
 	case "recovery":
+		fs := flag.NewFlagSet("sync recovery", flag.ContinueOnError)
+		fs.SetOutput(os.Stderr)
+		clearLock := fs.String("clear-lock", "", "clear a verified orphaned mirror lock")
+		root := fs.String("root", filepath.Dir(journalDir), "Syntroph data root")
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return errors.New("sync recovery accepts only --clear-lock and --root")
+		}
+		if *clearLock != "" {
+			locks, err := storage.NewMirrorLocks(filepath.Join(*root, "storage"))
+			if err != nil {
+				return err
+			}
+			if err := locks.ClearOrphan(ctx, *clearLock); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "Verified orphaned mirror lock cleared: %s. No external effect was executed.\n", *clearLock)
+			return nil
+		}
 		items, e := core.InspectRecovery(ctx, j)
 		if e != nil {
 			return e
@@ -71,7 +92,7 @@ func run(args []string, out, errOut interface{ Write([]byte) (int, error) }) err
 		}
 		fmt.Fprintln(out, "Recovery plan (no external effects are executed automatically):")
 		for _, item := range items {
-			fmt.Fprintf(out, "- saga %s: %s; attempts: %d; last error: %s; next: %s\n", item.SagaID, item.State, len(item.Attempts), item.LastError, item.NextAction)
+			fmt.Fprintf(out, "- saga %s: %s; provider: %s; remote: %s %s; revision: %s; failure: %s; evidence: %s; attempts: %d; last error: %s; next: %s\n", item.SagaID, item.State, item.Provider, item.RemoteID, item.RemoteURL, item.RemoteRevision, item.FailureClass, item.ConflictSnapshot, len(item.Attempts), item.LastError, item.NextAction)
 			for _, attempt := range item.Attempts {
 				fmt.Fprintf(out, "  attempt %s/%s at %s: %s", attempt.HandlerID, attempt.EventID, attempt.AttemptedAt.Format(time.RFC3339Nano), attempt.Outcome)
 				if attempt.Error != "" {

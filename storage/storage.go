@@ -12,8 +12,10 @@ import (
 )
 
 var (
-	ErrUnavailable = errors.New("storage mirror unavailable")
-	ErrConflict    = errors.New("storage mirror conflict")
+	ErrUnavailable         = errors.New("storage mirror unavailable")
+	ErrConflict            = errors.New("storage mirror conflict")
+	ErrPrerequisiteMissing = errors.New("storage prerequisite missing")
+	ErrMirrorInProgress    = errors.New("storage mirror already in progress")
 )
 
 type Backend string
@@ -26,9 +28,19 @@ const (
 type MirrorState string
 
 const (
-	Mirrored            MirrorState = "mirrored"
-	StorageSyncPending  MirrorState = "StorageSyncPending"
-	StorageSyncConflict MirrorState = "StorageSyncConflict"
+	Mirrored                   MirrorState = "mirrored"
+	StorageSyncPending         MirrorState = "StorageSyncPending"
+	StorageSyncConflict        MirrorState = "StorageSyncConflict"
+	StoragePrerequisiteMissing MirrorState = "StoragePrerequisiteMissing"
+)
+
+type FailureClass string
+
+const (
+	FailureTransient         FailureClass = "transient"
+	FailureConflict          FailureClass = "conflict"
+	FailurePrerequisite      FailureClass = "prerequisite_missing"
+	FailureAlreadyInProgress FailureClass = "already_in_progress"
 )
 
 // SessionDiary is the immutable local document handed to a mirror. Mirrors
@@ -49,19 +61,26 @@ func (d SessionDiary) Validate() error {
 }
 
 func (d SessionDiary) Key() string {
-	h := sha256.New()
-	fmt.Fprintf(h, "%s\x00%s\x00%s", d.RepositoryID, d.CommitSHA, d.ArtifactHash)
-	return hex.EncodeToString(h.Sum(nil))
+	sum := sha256.Sum256([]byte(d.RepositoryID + "\n" + d.CommitSHA + "\n" + d.ArtifactHash))
+	return hex.EncodeToString(sum[:])
 }
 
 type MirrorResult struct {
-	State       MirrorState
-	Backend     Backend
-	Key         string
-	RemoteID    string
-	RemoteRev   string
-	ExpectedRev string
-	Cause       error
+	State               MirrorState
+	Backend             Backend
+	Provider            string
+	Key                 string
+	RemoteID            string
+	RemoteURL           string
+	RemoteRev           string
+	ExpectedRev         string
+	LocalHash           string
+	EffectiveRemoteHash string
+	RemoteContent       string
+	FailureClass        FailureClass
+	ConflictSnapshot    string
+	AlreadyInProgress   bool
+	Cause               error
 }
 
 func (r MirrorResult) Pending() bool  { return r.State == StorageSyncPending }
@@ -79,6 +98,7 @@ type StoragePort interface {
 // Wiki page or Issue mirror.
 type RemoteDocument struct {
 	ID       string
+	URL      string
 	Revision string
 	Content  string
 	NotFound bool
@@ -109,52 +129,71 @@ func NewMirror(backend Backend, repository string, client GitHubClient) (*Mirror
 }
 
 func (m *Mirror) Mirror(ctx context.Context, diary SessionDiary) MirrorResult {
-	r := MirrorResult{Backend: m.Backend, Key: diary.Key()}
+	r := MirrorResult{Backend: m.Backend, Key: diary.Key(), LocalHash: contentHash(diary.Content)}
 	if err := diary.Validate(); err != nil {
-		r.State, r.Cause = StorageSyncPending, err
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, err
 		return r
 	}
 	remote, err := m.Client.Get(ctx, m.Backend, m.Repository, r.Key)
 	if err != nil {
-		r.State, r.Cause = StorageSyncPending, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		if errors.Is(err, ErrPrerequisiteMissing) {
+			r.State, r.FailureClass, r.Cause = StoragePrerequisiteMissing, FailurePrerequisite, err
+			return r
+		}
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, fmt.Errorf("%w: %v", ErrUnavailable, err)
 		return r
 	}
 	if !remote.NotFound && remote.Content == diary.Content {
-		r.State, r.RemoteID, r.RemoteRev = Mirrored, remote.ID, remote.Revision
+		r.State, r.RemoteID, r.RemoteURL, r.RemoteRev = Mirrored, remote.ID, remote.URL, remote.Revision
+		r.EffectiveRemoteHash = contentHash(remote.Content)
 		return r
 	}
 	if !remote.NotFound {
-		r.State, r.RemoteID, r.RemoteRev, r.ExpectedRev = StorageSyncConflict, remote.ID, remote.Revision, ""
-		r.Cause = ErrConflict
+		r.State, r.FailureClass = StorageSyncConflict, FailureConflict
+		r.RemoteID, r.RemoteURL, r.RemoteRev, r.ExpectedRev = remote.ID, remote.URL, remote.Revision, ""
+		r.RemoteContent, r.EffectiveRemoteHash, r.Cause = remote.Content, contentHash(remote.Content), ErrConflict
 		return r
 	}
 	created, err := m.Client.Put(ctx, m.Backend, m.Repository, r.Key, diary.Content, "")
 	if err != nil {
-		r.State, r.Cause = StorageSyncPending, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		if errors.Is(err, ErrPrerequisiteMissing) {
+			r.State, r.FailureClass, r.Cause = StoragePrerequisiteMissing, FailurePrerequisite, err
+			return r
+		}
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, fmt.Errorf("%w: %v", ErrUnavailable, err)
 		return r
 	}
-	r.State, r.RemoteID, r.RemoteRev = Mirrored, created.ID, created.Revision
+	r.State, r.RemoteID, r.RemoteURL, r.RemoteRev = Mirrored, created.ID, created.URL, created.Revision
+	r.EffectiveRemoteHash = contentHash(created.Content)
+	if r.EffectiveRemoteHash == contentHash("") {
+		r.EffectiveRemoteHash = r.LocalHash
+	}
 	return r
 }
 
 func (m *Mirror) Status(ctx context.Context, diary SessionDiary) MirrorResult {
-	r := MirrorResult{Backend: m.Backend, Key: diary.Key()}
+	r := MirrorResult{Backend: m.Backend, Key: diary.Key(), LocalHash: contentHash(diary.Content)}
 	if err := diary.Validate(); err != nil {
-		r.State, r.Cause = StorageSyncPending, err
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, err
 		return r
 	}
 	remote, err := m.Client.Get(ctx, m.Backend, m.Repository, r.Key)
 	if err != nil {
-		r.State, r.Cause = StorageSyncPending, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		if errors.Is(err, ErrPrerequisiteMissing) {
+			r.State, r.FailureClass, r.Cause = StoragePrerequisiteMissing, FailurePrerequisite, err
+			return r
+		}
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, fmt.Errorf("%w: %v", ErrUnavailable, err)
 		return r
 	}
 	if remote.NotFound {
-		r.State, r.Cause = StorageSyncPending, errors.New("remote document not found")
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, errors.New("remote document not found")
 		return r
 	}
-	r.RemoteID, r.RemoteRev = remote.ID, remote.Revision
+	r.RemoteID, r.RemoteURL, r.RemoteRev = remote.ID, remote.URL, remote.Revision
+	r.RemoteContent, r.EffectiveRemoteHash = remote.Content, contentHash(remote.Content)
 	if remote.Content != diary.Content {
-		r.State, r.Cause = StorageSyncConflict, ErrConflict
+		r.State, r.FailureClass, r.Cause = StorageSyncConflict, FailureConflict, ErrConflict
 		return r
 	}
 	r.State = Mirrored
@@ -172,19 +211,24 @@ const (
 )
 
 func (m *Mirror) Resolve(ctx context.Context, diary SessionDiary, choice Resolution, observedRevision string) MirrorResult {
-	r := MirrorResult{Backend: m.Backend, Key: diary.Key()}
+	r := MirrorResult{Backend: m.Backend, Key: diary.Key(), LocalHash: contentHash(diary.Content)}
 	if choice != KeepLocal && choice != KeepRemote {
-		r.State, r.Cause = StorageSyncConflict, errors.New("resolution must be keep-local or keep-remote")
+		r.State, r.FailureClass, r.Cause = StorageSyncConflict, FailureConflict, errors.New("resolution must be keep-local or keep-remote")
 		return r
 	}
 	remote, err := m.Client.Get(ctx, m.Backend, m.Repository, r.Key)
 	if err != nil {
-		r.State, r.Cause = StorageSyncPending, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		if errors.Is(err, ErrPrerequisiteMissing) {
+			r.State, r.FailureClass, r.Cause = StoragePrerequisiteMissing, FailurePrerequisite, err
+			return r
+		}
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, fmt.Errorf("%w: %v", ErrUnavailable, err)
 		return r
 	}
-	r.RemoteID, r.RemoteRev, r.ExpectedRev = remote.ID, remote.Revision, observedRevision
+	r.RemoteID, r.RemoteURL, r.RemoteRev, r.ExpectedRev = remote.ID, remote.URL, remote.Revision, observedRevision
+	r.RemoteContent, r.EffectiveRemoteHash = remote.Content, contentHash(remote.Content)
 	if observedRevision == "" || remote.Revision != observedRevision {
-		r.State, r.Cause = StorageSyncConflict, ErrConflict
+		r.State, r.FailureClass, r.Cause = StorageSyncConflict, FailureConflict, ErrConflict
 		return r
 	}
 	if choice == KeepRemote {
@@ -193,9 +237,22 @@ func (m *Mirror) Resolve(ctx context.Context, diary SessionDiary, choice Resolut
 	}
 	updated, err := m.Client.Put(ctx, m.Backend, m.Repository, r.Key, diary.Content, observedRevision)
 	if err != nil {
-		r.State, r.Cause = StorageSyncPending, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		if errors.Is(err, ErrPrerequisiteMissing) {
+			r.State, r.FailureClass, r.Cause = StoragePrerequisiteMissing, FailurePrerequisite, err
+			return r
+		}
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, fmt.Errorf("%w: %v", ErrUnavailable, err)
 		return r
 	}
-	r.State, r.RemoteID, r.RemoteRev = Mirrored, updated.ID, updated.Revision
+	r.State, r.RemoteID, r.RemoteURL, r.RemoteRev = Mirrored, updated.ID, updated.URL, updated.Revision
+	r.EffectiveRemoteHash = contentHash(updated.Content)
+	if r.EffectiveRemoteHash == contentHash("") {
+		r.EffectiveRemoteHash = r.LocalHash
+	}
 	return r
+}
+
+func contentHash(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
 }

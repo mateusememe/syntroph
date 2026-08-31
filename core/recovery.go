@@ -10,13 +10,21 @@ import (
 // RecoveryItem is the durable, read-only projection used by CLI and dashboard
 // clients. Inspecting recovery never invokes a handler or external adapter.
 type RecoveryItem struct {
-	SagaID       string
-	EventID      string
-	RepositoryID string
-	State        string
-	Attempts     []HandlerAttempt
-	LastError    string
-	NextAction   string
+	SagaID           string
+	EventID          string
+	RepositoryID     string
+	IdempotencyKey   string
+	State            string
+	Backend          string
+	Provider         string
+	RemoteID         string
+	RemoteURL        string
+	RemoteRevision   string
+	FailureClass     string
+	ConflictSnapshot string
+	Attempts         []HandlerAttempt
+	LastError        string
+	NextAction       string
 }
 
 // InspectRecovery derives pending obligations from the journal. A failed
@@ -39,39 +47,63 @@ func InspectRecovery(ctx context.Context, journal *SagaJournal) ([]RecoveryItem,
 		// A handler may be delivered more than once. Only the latest attempt
 		// for each handler represents its current obligation; the journal still
 		// retains every attempt for audit and recovery explanations.
-		latest := make(map[string]HandlerAttempt)
+		graphState := ""
+		var storageResult *StorageResult
+		storageResolved := false
 		for _, record := range records {
 			if record.Attempt != nil {
 				item.Attempts = append(item.Attempts, *record.Attempt)
-				latest[record.Attempt.HandlerID] = *record.Attempt
+				continue
 			}
-		}
-		for _, record := range records {
 			if record.Event != nil {
 				item.EventID, item.RepositoryID = record.Event.EventID, record.Event.RepositoryID
-				if record.Event.Type == "storage.sync.resolved" || record.Event.Type == "storage.sync.succeeded" {
-					item.State, item.NextAction = "Succeeded", "none"
-					continue
-				}
-				if record.Event.Type == "storage.sync.pending" {
-					item.State, item.NextAction = "StorageSyncPending", "syntroph sync retry --storage"
-				}
 				var diary SessionDiary
 				if record.Event.Type == "session.closed" && json.Unmarshal(record.Event.Payload, &diary) == nil {
+					item.IdempotencyKey = diary.IdempotencyKey
 					switch diary.GraphState {
 					case GraphResolutionPending:
-						item.State, item.NextAction = GraphResolutionPending, "syntroph sync retry --graph"
+						graphState = GraphResolutionPending
 					case GraphSyncPending:
-						item.State, item.NextAction = GraphSyncPending, "syntroph sync retry --graph"
+						graphState = GraphSyncPending
+					}
+				}
+				switch record.Event.Type {
+				case "storage.sync.succeeded", "storage.sync.resolved":
+					storageResolved = true
+					var result StorageResult
+					if json.Unmarshal(record.Event.Payload, &result) == nil && result.Key != "" {
+						storageResult = &result
+					}
+				case "storage.sync.pending", "storage.sync.conflict", "storage.prerequisite.missing":
+					var result StorageResult
+					if json.Unmarshal(record.Event.Payload, &result) == nil {
+						storageResult, storageResolved = &result, false
 					}
 				}
 			}
 		}
-		for _, attempt := range latest {
-			if attempt.Outcome == "failed" {
-				item.State = "HandlerPending"
-				item.LastError = attempt.Error
-				item.NextAction = "syntroph sync retry"
+
+		if storageResult != nil && !storageResolved {
+			applyStorageRecovery(&item, *storageResult)
+		} else {
+			handlerPending := false
+			seenHandlers := make(map[string]bool)
+			for i := len(item.Attempts) - 1; i >= 0; i-- {
+				attempt := item.Attempts[i]
+				if seenHandlers[attempt.HandlerID] {
+					continue
+				}
+				seenHandlers[attempt.HandlerID] = true
+				if attempt.HandlerID != "storage-mirror" && attempt.Outcome == "failed" {
+					item.State = "HandlerPending"
+					item.LastError = attempt.Error
+					item.NextAction = "syntroph sync retry"
+					handlerPending = true
+					break
+				}
+			}
+			if !handlerPending && graphState != "" {
+				item.State, item.NextAction = graphState, "syntroph sync retry --graph"
 			}
 		}
 		if item.State != "Succeeded" {
@@ -80,4 +112,41 @@ func InspectRecovery(ctx context.Context, journal *SagaJournal) ([]RecoveryItem,
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].SagaID < items[j].SagaID })
 	return items, nil
+}
+
+func applyStorageRecovery(item *RecoveryItem, result StorageResult) {
+	item.State = result.State
+	item.IdempotencyKey = firstNonEmpty(result.Key, item.IdempotencyKey)
+	item.Backend, item.Provider = result.Backend, result.Provider
+	item.RemoteID, item.RemoteURL, item.RemoteRevision = result.RemoteID, result.RemoteURL, result.RemoteRev
+	item.FailureClass, item.ConflictSnapshot = result.FailureClass, result.ConflictSnapshot
+	item.LastError = firstNonEmpty(result.Error, errorString(result.Cause))
+	switch result.State {
+	case "StorageSyncConflict":
+		item.NextAction = fmt.Sprintf("syntroph sync resolve %s --keep-local|--keep-remote", item.SagaID)
+	case "StoragePrerequisiteMissing":
+		item.NextAction = "syntroph doctor storage"
+	default:
+		if result.AlreadyInProgress {
+			item.NextAction = fmt.Sprintf("syntroph sync recovery --clear-lock %s", item.IdempotencyKey)
+		} else {
+			item.NextAction = "syntroph sync retry --storage"
+		}
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
