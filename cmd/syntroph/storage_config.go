@@ -10,10 +10,12 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/mateusememe/syntroph/adapters/githubissues"
 	"github.com/mateusememe/syntroph/adapters/githubwiki"
 	"github.com/mateusememe/syntroph/adapters/storageadapter"
 	"github.com/mateusememe/syntroph/config"
 	"github.com/mateusememe/syntroph/core"
+	"github.com/mateusememe/syntroph/storage"
 )
 
 func doctorStorage(args []string, out, errOut interface{ Write([]byte) (int, error) }) error {
@@ -119,6 +121,9 @@ func loadConfiguredStorage(ctx context.Context, root, repositoryRoot string, dep
 	} else if report.Ready && deps.providerBuilder != nil {
 		provider = deps.providerBuilder(resolved)
 	}
+	if report.Ready && provider == nil {
+		provider = concreteStorageProvider(resolved, root, deps.getenv)
+	}
 	adapter := storageadapter.Adapter{Provider: provider, Backend: resolved.Backend, ProviderID: resolved.Provider, Check: staticCheck(report)}
 	return adapter, report
 }
@@ -159,6 +164,39 @@ func wikiRemoteURL(origin string, resolved config.ResolvedStorage) string {
 		return strings.TrimRight(value, "/") + ".wiki.git"
 	}
 	return "https://github.com/" + resolved.Repository + ".wiki.git"
+}
+
+func concreteStorageProvider(resolved config.ResolvedStorage, root string, getenv func(string) string) storageadapter.Provider {
+	if resolved.Provider != config.ProviderGitHubREST {
+		return nil
+	}
+	remote, err := githubissues.New(resolved.Repository, getenv(storage.GitHubTokenEnvironment), filepath.Join(root, "storage"), githubissues.Options{})
+	if err != nil {
+		return failedStorageProvider{backend: storage.BackendIssues, provider: resolved.Provider, cause: err}
+	}
+	managed, err := storage.NewManagedMirror(filepath.Join(root, "storage"), resolved.Provider, remote)
+	if err != nil {
+		return failedStorageProvider{backend: storage.BackendIssues, provider: resolved.Provider, cause: err}
+	}
+	return managed
+}
+
+type failedStorageProvider struct {
+	backend  storage.Backend
+	provider string
+	cause    error
+}
+
+func (p failedStorageProvider) Mirror(_ context.Context, diary storage.SessionDiary) storage.MirrorResult {
+	state, class := storage.StorageSyncPending, storage.FailureTransient
+	if errors.Is(p.cause, storage.ErrPrerequisiteMissing) {
+		state, class = storage.StoragePrerequisiteMissing, storage.FailurePrerequisite
+	}
+	return storage.MirrorResult{State: state, Backend: p.backend, Provider: p.provider, Key: diary.Key(), FailureClass: class, Cause: p.cause}
+}
+
+func (p failedStorageProvider) Resolve(_ context.Context, diary storage.SessionDiary, _ storage.Resolution, _ string) storage.MirrorResult {
+	return p.Mirror(context.Background(), diary)
 }
 
 func staticCheck(report core.StoragePreflightResult) func(context.Context) core.StoragePreflightResult {

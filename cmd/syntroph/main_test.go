@@ -18,14 +18,31 @@ import (
 	"github.com/mateusememe/syntroph/storage"
 )
 
-type countingStorageProvider struct{ mirrorCalls int }
+type countingStorageProvider struct {
+	mirrorCalls      int
+	resolveCalls     int
+	resolveChoice    storage.Resolution
+	resolveRevision  string
+	mirrorResult     storage.MirrorResult
+	resolutionResult storage.MirrorResult
+}
 
 func (p *countingStorageProvider) Mirror(_ context.Context, diary storage.SessionDiary) storage.MirrorResult {
 	p.mirrorCalls++
+	if p.mirrorResult.State != "" {
+		result := p.mirrorResult
+		result.Key = diary.Key()
+		return result
+	}
 	return storage.MirrorResult{State: storage.Mirrored, Backend: storage.BackendIssues, Provider: "test-provider", Key: diary.Key()}
 }
 
-func (p *countingStorageProvider) Resolve(context.Context, storage.SessionDiary, storage.Resolution, string) storage.MirrorResult {
+func (p *countingStorageProvider) Resolve(_ context.Context, _ storage.SessionDiary, choice storage.Resolution, revision string) storage.MirrorResult {
+	p.resolveCalls++
+	p.resolveChoice, p.resolveRevision = choice, revision
+	if p.resolutionResult.State != "" {
+		return p.resolutionResult
+	}
 	return storage.MirrorResult{State: storage.Mirrored}
 }
 
@@ -384,6 +401,26 @@ func TestWikiProviderWiresSessionCloseRetryAndResolveThroughConfiguredStorage(t 
 	}
 	editCLIWikiPage(t, remote, filepath.ToSlash(pageRelative), string(original)+"\nHuman remote edit.\n")
 	revision := "git:" + strings.TrimSpace(cliGit(t, "--git-dir", remote, "rev-parse", "HEAD"))
+	storagePort := configuredStorage(root, repositoryRoot)
+	eventAware, ok := storagePort.(core.EventAwareStoragePort)
+	if !ok {
+		t.Fatal("configured Wiki storage does not expose event-aware mirroring")
+	}
+	conflict := eventAware.MirrorEvent(context.Background(), closed.Diary.SessionID+":storage-conflict-check", closed.Diary)
+	if conflict.State != "StorageSyncConflict" || conflict.RemoteRev != revision || conflict.ConflictSnapshot == "" {
+		t.Fatalf("Wiki conflict was not persisted for explicit resolution: %+v", conflict)
+	}
+	conflictPayload, err := json.Marshal(conflict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.AppendEvent(context.Background(), core.Event{
+		EventID: closed.Diary.SessionID + ":storage-conflict-check", Type: "storage.sync.conflict",
+		OccurredAt: time.Now().UTC(), RepositoryID: closed.Diary.RepositoryID, SagaID: closed.Diary.SessionID,
+		CorrelationID: closed.Diary.SessionID, CausationID: closed.Diary.SessionID, SchemaVersion: 1, Payload: conflictPayload,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	out.Reset()
 	if err := run([]string{"sync", "resolve", closed.Diary.SessionID, "--keep-local", "--revision", revision, "--root", root}, &out, os.Stderr); err != nil {
@@ -443,6 +480,120 @@ func cliGit(t *testing.T, args ...string) string {
 		t.Fatalf("git %v: %v: %s", args, err, output)
 	}
 	return string(output)
+}
+
+func TestStorageRetryReplaysPrerequisiteFailureAndJournalsBindingResult(t *testing.T) {
+	_, root := configuredTestRepository(t, "storage:\n  backend: issues\n  provider: github-rest\n")
+	t.Setenv("SYNTROPH_GITHUB_TOKEN", "injected-for-test")
+	provider := &countingStorageProvider{mirrorResult: storage.MirrorResult{
+		State: storage.Mirrored, Backend: storage.BackendIssues, Provider: "github-rest",
+		RemoteID: "41", RemoteURL: "https://github.test/issues/41",
+		RemoteRev: "issue:41:2026-08-31T12:00:00Z:" + strings.Repeat("b", 64),
+		LocalHash: strings.Repeat("a", 64), EffectiveRemoteHash: strings.Repeat("a", 64),
+	}}
+	previous := storageProviderBuilder
+	storageProviderBuilder = func(config.ResolvedStorage) storageadapter.Provider { return provider }
+	t.Cleanup(func() { storageProviderBuilder = previous })
+
+	diary := recoveryTestDiary("retry-prerequisite")
+	journal, err := core.NewSagaJournal(filepath.Join(root, "journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendSessionAndStorageResult(t, journal, diary, core.StorageResult{State: "StoragePrerequisiteMissing", Backend: "issues", Provider: "github-rest", Key: diary.IdempotencyKey, FailureClass: "prerequisite_missing", Error: "token was missing"})
+
+	var out bytes.Buffer
+	if err := run([]string{"sync", "--journal=" + filepath.Join(root, "journal"), "retry", "--storage"}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if provider.mirrorCalls != 1 || !strings.Contains(out.String(), "1 saga") {
+		t.Fatalf("calls=%d output=%s", provider.mirrorCalls, out.String())
+	}
+	items, err := core.InspectRecovery(context.Background(), journal)
+	if err != nil || len(items) != 0 {
+		t.Fatalf("retry did not resolve recovery: items=%+v err=%v", items, err)
+	}
+	records, err := journal.ReadSaga(context.Background(), diary.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundBindingResult := false
+	for _, record := range records {
+		if record.Event != nil && record.Event.Type == "storage.sync.succeeded" && strings.Contains(string(record.Event.Payload), `"remote_id":"41"`) {
+			foundBindingResult = true
+		}
+	}
+	if !foundBindingResult {
+		t.Fatal("retry journal omitted the provider binding result")
+	}
+}
+
+func TestConfiguredStorageResolveDisplaysPersistedDiffBeforeProviderEffect(t *testing.T) {
+	_, root := configuredTestRepository(t, "storage:\n  backend: issues\n  provider: github-rest\n")
+	t.Setenv("SYNTROPH_GITHUB_TOKEN", "injected-for-test")
+	revision := "issue:42:2026-08-31T12:00:00Z:" + strings.Repeat("c", 64)
+	provider := &countingStorageProvider{resolutionResult: storage.MirrorResult{
+		State: storage.Mirrored, Backend: storage.BackendIssues, Provider: "github-rest",
+		RemoteID: "42", RemoteURL: "https://github.test/issues/42", RemoteRev: "comment:7:2026-08-31T12:01:00Z:" + strings.Repeat("d", 64),
+		LocalHash: strings.Repeat("a", 64), EffectiveRemoteHash: strings.Repeat("a", 64),
+	}}
+	previous := storageProviderBuilder
+	storageProviderBuilder = func(config.ResolvedStorage) storageadapter.Provider { return provider }
+	t.Cleanup(func() { storageProviderBuilder = previous })
+
+	diary := recoveryTestDiary("resolve-conflict")
+	journal, err := core.NewSagaJournal(filepath.Join(root, "journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := filepath.Join(root, "storage", "conflicts", diary.IdempotencyKey, "issue.remote.md")
+	if err := os.MkdirAll(filepath.Dir(snapshot), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapshot, []byte("human remote edit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	appendSessionAndStorageResult(t, journal, diary, core.StorageResult{
+		State: "StorageSyncConflict", Backend: "issues", Provider: "github-rest", Key: diary.IdempotencyKey,
+		RemoteID: "42", RemoteURL: "https://github.test/issues/42", RemoteRev: revision,
+		FailureClass: "conflict", ConflictSnapshot: snapshot, Error: "remote diverged",
+	})
+
+	var out bytes.Buffer
+	if err := run([]string{"sync", "--journal=" + filepath.Join(root, "journal"), "resolve", diary.SessionID, "--keep-local", "--root", root}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if provider.resolveCalls != 1 || provider.resolveChoice != storage.KeepLocal || provider.resolveRevision != revision {
+		t.Fatalf("resolve calls=%d choice=%s revision=%s", provider.resolveCalls, provider.resolveChoice, provider.resolveRevision)
+	}
+	for _, want := range []string{"--- local", diary.Summary, "--- remote", "human remote edit", "keep-local"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("resolve output missing %q: %s", want, out.String())
+		}
+	}
+	items, err := core.InspectRecovery(context.Background(), journal)
+	if err != nil || len(items) != 0 {
+		t.Fatalf("resolution remains pending: items=%+v err=%v", items, err)
+	}
+}
+
+func recoveryTestDiary(sessionID string) core.SessionDiary {
+	return core.SessionDiary{
+		SessionID: sessionID, IdempotencyKey: strings.Repeat("e", 64), RepositoryID: "github.com/mateusememe/syntroph",
+		CommitSHA: "abc123", ArtifactHash: strings.Repeat("f", 64), Author: "matt", CreatedAt: time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC), Title: "Session diary", Summary: "durable local knowledge",
+	}
+}
+
+func appendSessionAndStorageResult(t *testing.T, journal *core.SagaJournal, diary core.SessionDiary, result core.StorageResult) {
+	t.Helper()
+	payload, _ := json.Marshal(diary)
+	if err := journal.AppendEvent(context.Background(), core.Event{EventID: diary.SessionID, Type: "session.closed", OccurredAt: diary.CreatedAt, RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, SchemaVersion: 1, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ = json.Marshal(result)
+	if err := journal.AppendEvent(context.Background(), core.Event{EventID: diary.SessionID + ":storage", Type: storageResultEventType(result.State), OccurredAt: diary.CreatedAt, RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: diary.SessionID, SchemaVersion: 1, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func configuredTestRepository(t *testing.T, contents string) (string, string) {

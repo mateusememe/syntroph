@@ -202,16 +202,27 @@ func retry(args []string, journal *core.SagaJournal, journalDir string, out inte
 				return err
 			}
 		} else {
-			if err := retryStorage(context.Background(), journal, journalDir, item); err != nil {
-				if appendErr := journal.AppendAttempt(context.Background(), core.HandlerAttempt{EventID: e.EventID, SagaID: item.SagaID, HandlerID: "storage-retry", AttemptedAt: time.Now().UTC(), Outcome: "failed", Error: err.Error()}); appendErr != nil {
+			result, retryErr := retryStorage(context.Background(), journal, journalDir, item)
+			if retryErr != nil {
+				if appendErr := journal.AppendAttempt(context.Background(), core.HandlerAttempt{EventID: e.EventID, SagaID: item.SagaID, HandlerID: "storage-retry", AttemptedAt: time.Now().UTC(), Outcome: "failed", Error: retryErr.Error()}); appendErr != nil {
 					return appendErr
 				}
 				continue
 			}
-			if err := journal.AppendAttempt(context.Background(), core.HandlerAttempt{EventID: e.EventID, SagaID: item.SagaID, HandlerID: "storage-retry", AttemptedAt: time.Now().UTC(), Outcome: "succeeded"}); err != nil {
+			attempt := core.HandlerAttempt{EventID: e.EventID, SagaID: item.SagaID, HandlerID: "storage-retry", AttemptedAt: time.Now().UTC(), Outcome: "succeeded"}
+			if result.State != "mirrored" {
+				attempt.Outcome = "failed"
+				if result.Cause != nil {
+					attempt.Error = result.Cause.Error()
+				}
+			}
+			if err := journal.AppendAttempt(context.Background(), attempt); err != nil {
 				return err
 			}
-			_ = journal.AppendEvent(context.Background(), core.Event{EventID: item.SagaID + ":storage-succeeded", Type: "storage.sync.succeeded", OccurredAt: time.Now().UTC(), RepositoryID: item.RepositoryID, SagaID: item.SagaID, CorrelationID: item.SagaID, CausationID: e.EventID, SchemaVersion: 1, Payload: []byte(`{"state":"mirrored"}`)})
+			payload, _ := json.Marshal(result)
+			if err := journal.AppendEvent(context.Background(), core.Event{EventID: item.SagaID + ":storage-retry-result", Type: storageResultEventType(result.State), OccurredAt: time.Now().UTC(), RepositoryID: item.RepositoryID, SagaID: item.SagaID, CorrelationID: item.SagaID, CausationID: e.EventID, SchemaVersion: 1, Payload: payload}); err != nil {
+				return err
+			}
 		}
 		count++
 	}
@@ -235,25 +246,32 @@ func diaryFromSaga(ctx context.Context, journal *core.SagaJournal, saga string) 
 	return core.SessionDiary{}, errors.New("session diary not found in saga journal")
 }
 
-func retryStorage(ctx context.Context, journal *core.SagaJournal, journalDir string, item core.RecoveryItem) error {
+func retryStorage(ctx context.Context, journal *core.SagaJournal, journalDir string, item core.RecoveryItem) (core.StorageResult, error) {
 	diary, err := diaryFromSaga(ctx, journal, item.SagaID)
 	if err != nil {
-		return err
+		return core.StorageResult{}, err
 	}
 	syntrophRoot := filepath.Dir(journalDir)
 	port := configuredStorage(syntrophRoot, filepath.Dir(syntrophRoot))
 	resolver, ok := port.(core.EventAwareStoragePort)
 	if !ok || resolver == nil {
-		return errors.New("storage adapter is not configured")
+		return core.StorageResult{}, errors.New("storage adapter is not configured")
 	}
 	r := resolver.MirrorEvent(ctx, item.SagaID+":storage-retry", diary)
-	if r.State != "mirrored" {
-		if r.Cause != nil {
-			return r.Cause
-		}
-		return errors.New("storage synchronization remains pending")
+	return r, nil
+}
+
+func storageResultEventType(state string) string {
+	switch state {
+	case "mirrored":
+		return "storage.sync.succeeded"
+	case "StorageSyncConflict":
+		return "storage.sync.conflict"
+	case "StoragePrerequisiteMissing":
+		return "storage.prerequisite.missing"
+	default:
+		return "storage.sync.pending"
 	}
-	return nil
 }
 
 func retryGraph(ctx context.Context, journal *core.SagaJournal, item core.RecoveryItem) error {
@@ -287,7 +305,7 @@ func resolve(args []string, out interface{ Write([]byte) (int, error) }) error {
 	}
 	fs := flag.NewFlagSet("sync resolve", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	local, remote, keepLocal, keepRemote := fs.String("local-file", "", "local canonical content"), fs.String("remote-file", "", "remote content observed"), fs.Bool("keep-local", false, "overwrite remote with local content"), fs.Bool("keep-remote", false, "acknowledge remote content")
+	local, remote, keepLocal, keepRemote := fs.String("local-file", "", "local canonical content"), fs.String("remote-file", "", "remote content observed"), fs.Bool("keep-local", false, "append a correction containing local content"), fs.Bool("keep-remote", false, "acknowledge remote content")
 	revision, root := fs.String("revision", "", "remote revision observed during diff"), fs.String("root", ".syntroph", "Syntroph data root")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -309,23 +327,60 @@ func resolve(args []string, out interface{ Write([]byte) (int, error) }) error {
 		if err != nil {
 			return err
 		}
+		items, err := core.InspectRecovery(context.Background(), journal)
+		if err != nil {
+			return err
+		}
+		var conflict core.RecoveryItem
+		for _, item := range items {
+			if item.SagaID == fs.Arg(0) {
+				conflict = item
+				break
+			}
+		}
+		if conflict.State != "StorageSyncConflict" || conflict.ConflictSnapshot == "" {
+			return errors.New("sync resolve requires a persisted storage conflict with offline diff evidence")
+		}
+		remoteContent, err := os.ReadFile(conflict.ConflictSnapshot)
+		if err != nil {
+			return fmt.Errorf("read remote conflict snapshot: %w", err)
+		}
+		localContent := core.RenderSessionDiary(diary)
+		fmt.Fprintf(out, "Conflict %s\n--- local\n%s\n--- remote\n%s\n", fs.Arg(0), localContent, remoteContent)
 		port := configuredStorage(*root, filepath.Dir(*root))
 		resolver, ok := port.(core.StorageResolver)
 		if !ok || resolver == nil {
 			return errors.New("sync resolve requires --local-file and --remote-file, or a configured storage adapter")
 		}
-		if *revision == "" {
-			return errors.New("sync resolve requires --revision for remote validation")
+		observedRevision := conflict.RemoteRevision
+		if *revision != "" && *revision != observedRevision {
+			return errors.New("--revision does not match the revision persisted with the displayed conflict")
 		}
-		r := resolver.Resolve(context.Background(), diary, map[bool]string{true: "keep-local", false: "keep-remote"}[*keepLocal], *revision)
+		if observedRevision == "" {
+			return errors.New("storage conflict does not contain an observed remote revision")
+		}
+		choice := map[bool]string{true: "keep-local", false: "keep-remote"}[*keepLocal]
+		r := resolver.Resolve(context.Background(), diary, choice, observedRevision)
+		attempt := core.HandlerAttempt{EventID: fs.Arg(0) + ":storage-resolve", SagaID: fs.Arg(0), HandlerID: "storage-resolve", AttemptedAt: time.Now().UTC(), Outcome: "succeeded"}
 		if r.State != "mirrored" {
+			attempt.Outcome = "failed"
 			if r.Cause != nil {
+				attempt.Error = r.Cause.Error()
+				_ = journal.AppendAttempt(context.Background(), attempt)
 				return r.Cause
 			}
+			attempt.Error = "storage conflict remains unresolved"
+			_ = journal.AppendAttempt(context.Background(), attempt)
 			return errors.New("storage conflict remains unresolved")
 		}
-		_ = journal.AppendEvent(context.Background(), core.Event{EventID: fs.Arg(0) + ":storage-resolved", Type: "storage.sync.resolved", OccurredAt: time.Now().UTC(), RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: fs.Arg(0), SchemaVersion: 1, Payload: []byte(`{"state":"mirrored"}`)})
-		fmt.Fprintf(out, "Resolution recorded: %s.\n", map[bool]string{true: "keep-local", false: "keep-remote"}[*keepLocal])
+		if err := journal.AppendAttempt(context.Background(), attempt); err != nil {
+			return err
+		}
+		payload, _ := json.Marshal(r)
+		if err := journal.AppendEvent(context.Background(), core.Event{EventID: fs.Arg(0) + ":storage-resolved", Type: "storage.sync.resolved", OccurredAt: time.Now().UTC(), RepositoryID: diary.RepositoryID, SagaID: fs.Arg(0), CorrelationID: fs.Arg(0), CausationID: conflict.EventID, SchemaVersion: 1, Payload: payload}); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Resolution recorded: %s.\n", choice)
 		return nil
 	}
 	if *local == "" || *remote == "" {

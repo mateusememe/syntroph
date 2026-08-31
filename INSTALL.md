@@ -55,6 +55,10 @@ syntroph doctor storage
 
 Syntroph does not use `GITHUB_TOKEN`, run `gh auth login`, inspect private `gh` credential files, or persist the token.
 
+The token must be able to read and write Issues and repository labels for the selected repository. Syntroph creates or reconciles the reserved `syntroph-memory` and `syntroph-session` labels before creating a mirror, then creates one completed Issue per Session Diary. If label administration or Issues access is unavailable, the local diary remains successful and recovery reports `StoragePrerequisiteMissing`; no unlabeled Issue is created.
+
+Remote failures are retried only when explicitly transient and remain visible through `syntroph sync recovery`. After fixing a prerequisite, run `syntroph sync retry --storage`. If a human edits the remote Issue body, `syntroph sync resolve <session-id> --keep-local` displays the persisted diff and appends a correction comment; `--keep-remote` accepts the edit. Neither choice overwrites the existing Issue body.
+
 ### GitHub Issues through an MCP stdio process
 
 ```yaml
