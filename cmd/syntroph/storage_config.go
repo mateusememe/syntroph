@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/mateusememe/syntroph/adapters/githubwiki"
 	"github.com/mateusememe/syntroph/adapters/storageadapter"
 	"github.com/mateusememe/syntroph/config"
 	"github.com/mateusememe/syntroph/core"
@@ -61,9 +62,11 @@ type storageDependencies struct {
 	lookPath        func(string) (string, error)
 	gitConfig       func(context.Context, string, string, string) (string, error)
 	providerBuilder func(config.ResolvedStorage) storageadapter.Provider
+	wikiBuilder     func(config.ResolvedStorage, string, string, string) storageadapter.Provider
 }
 
 var storageProviderBuilder = func(config.ResolvedStorage) storageadapter.Provider { return nil }
+var wikiStorageProviderBuilder = buildWikiStorageProvider
 
 func defaultStorageDependencies() storageDependencies {
 	return storageDependencies{
@@ -72,6 +75,7 @@ func defaultStorageDependencies() storageDependencies {
 		lookPath:        exec.LookPath,
 		gitConfig:       readGitConfig,
 		providerBuilder: storageProviderBuilder,
+		wikiBuilder:     wikiStorageProviderBuilder,
 	}
 }
 
@@ -110,11 +114,51 @@ func loadConfiguredStorage(ctx context.Context, root, repositoryRoot string, dep
 	}
 	report := checkStoragePrerequisites(ctx, repositoryRoot, resolved, deps)
 	var provider storageadapter.Provider
-	if report.Ready && deps.providerBuilder != nil {
+	if report.Ready && resolved.Provider == config.ProviderGitHubWikiGit && deps.wikiBuilder != nil {
+		provider = deps.wikiBuilder(resolved, root, repositoryRoot, origin)
+	} else if report.Ready && deps.providerBuilder != nil {
 		provider = deps.providerBuilder(resolved)
 	}
 	adapter := storageadapter.Adapter{Provider: provider, Backend: resolved.Backend, ProviderID: resolved.Provider, Check: staticCheck(report)}
 	return adapter, report
+}
+
+func buildWikiStorageProvider(resolved config.ResolvedStorage, root, repositoryRoot, origin string) storageadapter.Provider {
+	gitExecutable := strings.TrimSpace(resolved.Wiki.GitExecutable)
+	if gitExecutable == "" {
+		gitExecutable = "git"
+	}
+	provider, err := githubwiki.NewManaged(filepath.Join(root, "storage"), githubwiki.Options{
+		Repository: resolved.Repository, RepositoryRoot: repositoryRoot,
+		RemoteURL: wikiRemoteURL(origin, resolved), WebURL: "https://github.com/" + resolved.Repository + "/wiki",
+		GitExecutable: gitExecutable,
+		Author:        githubwiki.Author{Name: resolved.Wiki.CommitAuthor.Name, Email: resolved.Wiki.CommitAuthor.Email},
+	})
+	if err != nil {
+		return nil
+	}
+	return provider
+}
+
+func wikiRemoteURL(origin string, resolved config.ResolvedStorage) string {
+	if resolved.CrossRepository {
+		value := strings.TrimSpace(origin)
+		if strings.HasPrefix(value, "git@github.com:") {
+			return "git@github.com:" + resolved.Repository + ".wiki.git"
+		}
+		if strings.HasPrefix(value, "ssh://git@github.com/") {
+			return "ssh://git@github.com/" + resolved.Repository + ".wiki.git"
+		}
+		return "https://github.com/" + resolved.Repository + ".wiki.git"
+	}
+	value := strings.TrimSpace(origin)
+	if strings.HasSuffix(value, ".git") {
+		return strings.TrimSuffix(value, ".git") + ".wiki.git"
+	}
+	if strings.Contains(value, "github.com") {
+		return strings.TrimRight(value, "/") + ".wiki.git"
+	}
+	return "https://github.com/" + resolved.Repository + ".wiki.git"
 }
 
 func staticCheck(report core.StoragePreflightResult) func(context.Context) core.StoragePreflightResult {

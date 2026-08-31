@@ -389,6 +389,9 @@ func (m *ManagedMirror) run(ctx context.Context, diary SessionDiary, effect func
 			return result
 		}
 		result.ConflictSnapshot = path
+		if result.UnverifiedIdentity {
+			return result
+		}
 	}
 	binding := RemoteBinding{
 		IdempotencyKey: key, Backend: result.Backend, Provider: m.Provider,

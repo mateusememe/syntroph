@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mateusememe/syntroph/adapters/githubwiki"
 	"github.com/mateusememe/syntroph/adapters/storageadapter"
 	"github.com/mateusememe/syntroph/config"
 	"github.com/mateusememe/syntroph/core"
@@ -262,6 +263,186 @@ func TestSupportedStorageConfigurationReachesProviderNeutralMirrorSeam(t *testin
 	if provider.mirrorCalls != 1 {
 		t.Fatalf("supported configuration reached provider %d times", provider.mirrorCalls)
 	}
+}
+
+func TestWikiConfigurationBuildsGitProviderWithoutMutatingDoctorState(t *testing.T) {
+	_, root := configuredTestRepository(t, "storage:\n  backend: wiki\n  provider: github-wiki-git\n  wiki:\n    git_executable: git\n    commit_author:\n      name: Syntroph\n      email: syntroph@example.test\n")
+	previous := wikiStorageProviderBuilder
+	builds := 0
+	wikiStorageProviderBuilder = func(resolved config.ResolvedStorage, gotRoot, repositoryRoot, origin string) storageadapter.Provider {
+		builds++
+		if resolved.Repository != "mateusememe/syntroph" || gotRoot != root || repositoryRoot != filepath.Dir(root) || origin != "git@github.com:mateusememe/syntroph.git" {
+			t.Fatalf("unexpected Wiki builder inputs: resolved=%+v root=%s repository=%s origin=%s", resolved, gotRoot, repositoryRoot, origin)
+		}
+		return &countingStorageProvider{}
+	}
+	t.Cleanup(func() { wikiStorageProviderBuilder = previous })
+
+	var out bytes.Buffer
+	if err := run([]string{"doctor", "storage", "--root", root}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if builds != 1 || !strings.Contains(out.String(), "No authentication or remote write") {
+		t.Fatalf("Wiki doctor builds=%d output=%s", builds, out.String())
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "config.yaml" {
+		t.Fatalf("doctor mutated state: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestWikiRemoteURLPreservesOriginTransportAndUsesSafeCrossRepositoryDefault(t *testing.T) {
+	for _, tc := range []struct {
+		name, origin, want string
+	}{
+		{name: "SSH", origin: "git@github.com:acme/repo.git", want: "git@github.com:acme/repo.wiki.git"},
+		{name: "HTTPS", origin: "https://github.com/acme/repo.git", want: "https://github.com/acme/repo.wiki.git"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := wikiRemoteURL(tc.origin, config.ResolvedStorage{Repository: "acme/repo"})
+			if got != tc.want {
+				t.Fatalf("Wiki URL = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	for _, tc := range []struct{ origin, want string }{
+		{origin: "git@github.com:acme/repo.git", want: "git@github.com:central/memory.wiki.git"},
+		{origin: "ssh://git@github.com/acme/repo.git", want: "ssh://git@github.com/central/memory.wiki.git"},
+		{origin: "https://github.com/acme/repo.git", want: "https://github.com/central/memory.wiki.git"},
+	} {
+		cross := wikiRemoteURL(tc.origin, config.ResolvedStorage{Repository: "central/memory", CrossRepository: true})
+		if cross != tc.want {
+			t.Errorf("cross-repository Wiki URL for %q = %q, want %q", tc.origin, cross, tc.want)
+		}
+	}
+}
+
+func TestWikiProviderWiresSessionCloseRetryAndResolveThroughConfiguredStorage(t *testing.T) {
+	repositoryRoot, root := configuredTestRepository(t, "storage:\n  backend: wiki\n  provider: github-wiki-git\n  wiki:\n    git_executable: git\n    commit_author:\n      name: Syntroph\n      email: syntroph@example.test\n")
+	missingRemote := filepath.Join(t.TempDir(), "missing.wiki.git")
+	remote := missingRemote
+	previous := wikiStorageProviderBuilder
+	wikiStorageProviderBuilder = func(resolved config.ResolvedStorage, gotRoot, gotRepositoryRoot, _ string) storageadapter.Provider {
+		provider, err := githubwiki.NewManaged(filepath.Join(gotRoot, "storage"), githubwiki.Options{
+			Repository: resolved.Repository, RepositoryRoot: gotRepositoryRoot, RemoteURL: remote,
+			WebURL: "https://github.com/" + resolved.Repository + "/wiki", GitExecutable: resolved.Wiki.GitExecutable,
+			Author: githubwiki.Author{Name: resolved.Wiki.CommitAuthor.Name, Email: resolved.Wiki.CommitAuthor.Email},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return provider
+	}
+	t.Cleanup(func() { wikiStorageProviderBuilder = previous })
+
+	var out bytes.Buffer
+	if err := run([]string{"session", "close", "--summary", "Wiki CLI recovery", "--repository", "github.com/mateusememe/syntroph", "--commit", "wiki123", "--author", "matt", "--root", root}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	var closed struct {
+		Diary core.SessionDiary `json:"diary"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &closed); err != nil || closed.Diary.SessionID == "" {
+		t.Fatalf("decode closed diary: %+v err=%v output=%s", closed, err, out.String())
+	}
+	journalDir := filepath.Join(root, "journal")
+	journal, err := core.NewSagaJournal(journalDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := core.InspectRecovery(context.Background(), journal)
+	if err != nil || len(items) != 1 || items[0].State != "StoragePrerequisiteMissing" {
+		t.Fatalf("missing Wiki recovery = %+v err=%v", items, err)
+	}
+
+	remote = initializedCLIWiki(t)
+	out.Reset()
+	if err := run([]string{"sync", "--journal=" + journalDir, "retry", "--storage"}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "1 saga(s)") {
+		t.Fatalf("storage retry output: %s", out.String())
+	}
+	if items, err = core.InspectRecovery(context.Background(), journal); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		if strings.HasPrefix(item.State, "Storage") {
+			t.Fatalf("Wiki retry did not clear storage recovery: %+v", items)
+		}
+	}
+	inspect := filepath.Join(t.TempDir(), "inspect")
+	cliGit(t, "clone", "-q", remote, inspect)
+	pages, err := filepath.Glob(filepath.Join(inspect, "Sessions", "*", "*", closed.Diary.SessionID+"-*.md"))
+	if err != nil || len(pages) != 1 {
+		t.Fatalf("mirrored Wiki page = %v err=%v", pages, err)
+	}
+	pageRelative, _ := filepath.Rel(inspect, pages[0])
+	original, err := os.ReadFile(pages[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	editCLIWikiPage(t, remote, filepath.ToSlash(pageRelative), string(original)+"\nHuman remote edit.\n")
+	revision := "git:" + strings.TrimSpace(cliGit(t, "--git-dir", remote, "rev-parse", "HEAD"))
+
+	out.Reset()
+	if err := run([]string{"sync", "resolve", closed.Diary.SessionID, "--keep-local", "--revision", revision, "--root", root}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "keep-local") {
+		t.Fatalf("storage resolve output: %s", out.String())
+	}
+	cliGit(t, "-C", inspect, "pull", "-q", "--ff-only")
+	resolved, err := os.ReadFile(pages[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(resolved), "Human remote edit") || !strings.Contains(string(resolved), "Wiki CLI recovery") {
+		t.Fatalf("resolved Wiki content:\n%s", resolved)
+	}
+	if repositoryRoot != filepath.Dir(root) {
+		t.Fatalf("test repository root mismatch: %s root=%s", repositoryRoot, root)
+	}
+}
+
+func initializedCLIWiki(t *testing.T) string {
+	t.Helper()
+	base := t.TempDir()
+	remote := filepath.Join(base, "repo.wiki.git")
+	cliGit(t, "init", "-q", "--bare", remote)
+	seed := filepath.Join(base, "seed")
+	cliGit(t, "clone", "-q", remote, seed)
+	if err := os.WriteFile(filepath.Join(seed, "Home.md"), []byte("# Home\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, "-C", seed, "add", "Home.md")
+	cliGit(t, "-C", seed, "-c", "user.name=Seed", "-c", "user.email=seed@example.test", "commit", "-q", "-m", "initialize wiki")
+	cliGit(t, "-C", seed, "push", "-q", "origin", "HEAD")
+	return remote
+}
+
+func editCLIWikiPage(t *testing.T, remote, page, content string) {
+	t.Helper()
+	clone := filepath.Join(t.TempDir(), "edit")
+	cliGit(t, "clone", "-q", remote, clone)
+	path := filepath.Join(clone, filepath.FromSlash(page))
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, "-C", clone, "add", "--", page)
+	cliGit(t, "-C", clone, "-c", "user.name=Human", "-c", "user.email=human@example.test", "commit", "-q", "-m", "human edit")
+	cliGit(t, "-C", clone, "push", "-q", "origin", "HEAD")
+}
+
+func cliGit(t *testing.T, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, output)
+	}
+	return string(output)
 }
 
 func configuredTestRepository(t *testing.T, contents string) (string, string) {

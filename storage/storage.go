@@ -80,7 +80,10 @@ type MirrorResult struct {
 	FailureClass        FailureClass
 	ConflictSnapshot    string
 	AlreadyInProgress   bool
-	Cause               error
+	// UnverifiedIdentity prevents recovery from reconstructing a binding when
+	// a deterministic remote location does not carry the exact Syntroph marker.
+	UnverifiedIdentity bool
+	Cause              error
 }
 
 func (r MirrorResult) Pending() bool  { return r.State == StorageSyncPending }

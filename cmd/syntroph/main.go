@@ -183,7 +183,7 @@ func retry(args []string, journal *core.SagaJournal, journalDir string, out inte
 	}
 	count := 0
 	for _, item := range items {
-		if (scope == "graph" && item.State != core.GraphResolutionPending && item.State != core.GraphSyncPending) || (scope == "storage" && item.State != "StorageSyncPending") {
+		if (scope == "graph" && item.State != core.GraphResolutionPending && item.State != core.GraphSyncPending) || (scope == "storage" && item.State != "StorageSyncPending" && item.State != "StoragePrerequisiteMissing") {
 			continue
 		}
 		e := core.Event{EventID: item.SagaID + ":retry:" + scope, Type: "sync.retry.requested", OccurredAt: time.Now().UTC(), RepositoryID: item.RepositoryID, SagaID: item.SagaID, CorrelationID: item.SagaID, CausationID: item.EventID, SchemaVersion: 1, Payload: []byte(fmt.Sprintf(`{"scope":%q}`, scope))}
