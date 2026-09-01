@@ -108,3 +108,46 @@ syntroph doctor storage
 ```
 
 Doctor is non-mutating: it does not authenticate, edit configuration, initialize Wiki, or write remotely. Session close runs the same preflight only after its local Session Diary is durable. Missing prerequisites become `StoragePrerequisiteMissing`; fix them, inspect `syntroph sync recovery`, then confirm an external retry explicitly with `syntroph sync retry --storage`.
+
+## Storage recovery
+
+The local Session Diary under `.syntroph/memory/` is canonical and remains successful even when a mirror fails. Recovery is never executed automatically after a crash.
+
+```sh
+syntroph sync status
+syntroph sync recovery
+syntroph sync retry --storage
+syntroph sync resolve <session-id> --keep-local
+syntroph sync resolve <session-id> --keep-remote
+```
+
+`sync recovery` shows the selected provider, remote identity and typed revision when known, the failure class, private conflict snapshot, and the next explicit action. Retry preserves the original Idempotency Key and provider. Conflict resolution displays the local/remote diff first: Issues append a correction comment for `--keep-local`, while Wiki writes an auditable commit; `--keep-remote` accepts the observed remote revision. Never change provider while recovering one operation.
+
+## Opt-in live GitHub smoke
+
+Normal `go test ./...` and pull-request CI are offline. The live smoke is behind the `livegithub` build tag and a manual `workflow_dispatch`; the workflow has no `pull_request` trigger and should use a protected `live-storage-smoke` environment. Run it only against a dedicated disposable repository, never a production tracker or Wiki.
+
+Configure these repository environment values:
+
+- Variable `SYNTROPH_LIVE_GITHUB_REPOSITORY`: dedicated `owner/name` target.
+- Optional variable `SYNTROPH_LIVE_RUNNER`: a runner label with the required Git/MCP authentication; it defaults to `ubuntu-latest`.
+- Optional variable `SYNTROPH_LIVE_WIKI_REMOTE_URL`: authenticated Wiki remote when the normalized HTTPS URL is unsuitable.
+- Secret `SYNTROPH_LIVE_GITHUB_TOKEN`: used only by the `github-rest` job.
+- Secret `SYNTROPH_LIVE_MCP_COMMAND_JSON`: a JSON string array such as `["github-mcp-server","stdio","--toolsets=issues,labels"]`; the command must not contain a token. The MCP process owns authentication.
+
+The Wiki job receives no REST token. Its runner must already have a credential helper or SSH identity that can push to an enabled, initialized Wiki. The MCP runner must already provide the configured executable and non-interactive provider-owned authentication with Issue read/create/update, comment, labels, and Issue search capabilities.
+
+Start **Live storage smoke** from GitHub Actions, select one provider, and provide a new opaque `run_id`, for example `2026-09-01-rest-01`. The identity is included in the deterministic Session ID and Idempotency Key. The test mirrors once, replays the same operation, checks status and its typed Remote Binding, and prints `LIVE_SMOKE_RESOURCE` with the exact remote URL.
+
+For a local maintainer run, set only the variables required by the selected provider plus the explicit confirmation:
+
+```sh
+export SYNTROPH_LIVE_GITHUB_CONFIRM=I_UNDERSTAND_THIS_CREATES_PERSISTENT_GITHUB_RESOURCES
+export SYNTROPH_LIVE_STORAGE_PROVIDER=github-rest
+export SYNTROPH_LIVE_GITHUB_REPOSITORY=owner/disposable-syntroph-smoke
+export SYNTROPH_LIVE_RUN_ID=2026-09-01-rest-01
+export SYNTROPH_GITHUB_TOKEN='<dedicated token>'
+go test -tags=livegithub ./integration/livegithub -run '^TestConfiguredGitHubStorageProvider$' -count=1 -v
+```
+
+Smoke mirrors are intentionally persistent because deleting them would weaken the production immutability contract. Issues and MCP runs leave one closed, labeled Issue; Wiki runs leave one deterministic page/commit. Clean up only through the dedicated repository's normal administrative lifecycle (or delete the Wiki page with an explicit external Git commit). If a run fails after a remote effect, retain its logs and `run_id`, fix the prerequisite, and rerun the same provider and `run_id`; the exact marker reconstructs a missing local binding without creating a second mirror. Do not retry through another provider.

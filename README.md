@@ -12,7 +12,7 @@
 
 Syntroph is a Go toolkit and orchestrator that connects open-source development tools around a hexagonal (Ports & Adapters) core. Its event bus models syntrophy: one adapter's metabolic residue becomes another adapter's useful input.
 
-> **Status:** architecture and domain contracts are being shaped. The repository currently contains design documents and no released CLI binary yet.
+> **Status:** the CLI and local-first session-memory flow are implemented from source. Tagged binary releases are not available yet.
 
 ## Design
 
@@ -40,6 +40,16 @@ Session artifacts are structured Markdown or JSON. A manual `--summary` fallback
 Repository configuration uses `.syntroph/config.yaml` exclusively. Run `syntroph doctor storage` after cloning to validate the selected provider, normalized destination, and local prerequisites without authenticating or writing remotely. See [Installation](INSTALL.md#github-mirroring) for safe examples.
 
 The `github-mcp` Issues provider uses one explicitly configured stdio process per Syntroph operation. Its server must own non-interactive authentication and expose both the `issues` and `labels` toolsets; Syntroph validates the complete tool schema before any remote write.
+
+| Backend | Provider | Transport | Authentication owner |
+| --- | --- | --- | --- |
+| Issues | `github-rest` | GitHub REST API | `SYNTROPH_GITHUB_TOKEN`, injected externally |
+| Issues | `github-mcp` | Configured MCP stdio process | MCP server or wrapper |
+| Wiki | `github-wiki-git` | Wiki Git repository | Existing Git credential helper or SSH |
+
+Remote mirroring never changes the local success contract. A remote outage becomes `StorageSyncPending`, an external setup problem becomes `StoragePrerequisiteMissing`, and divergence becomes `StorageSyncConflict`. Inspect the durable plan with `syntroph sync recovery`; external retry and conflict resolution always require an explicit command.
+
+Maintainers can run the build-tagged [live storage smoke](INSTALL.md#opt-in-live-github-smoke) for any supported provider. The normal test suite and pull-request CI use only deterministic HTTP, isolated Git repositories, fake MCP processes, and in-memory fakes—no GitHub credentials or network are required.
 
 ## Selected engineering skills
 

@@ -1,0 +1,91 @@
+name: Live storage smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: Explicit provider to verify
+        required: true
+        type: choice
+        options:
+          - github-rest
+          - github-wiki-git
+          - github-mcp
+      run_id:
+        description: Stable isolated identity; reuse it only to recover a failed run
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-storage-smoke-${{ inputs.provider }}-${{ inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  rest:
+    if: inputs.provider == 'github-rest'
+    environment: live-storage-smoke
+    runs-on: ${{ vars.SYNTROPH_LIVE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    env:
+      SYNTROPH_LIVE_GITHUB_CONFIRM: I_UNDERSTAND_THIS_CREATES_PERSISTENT_GITHUB_RESOURCES
+      SYNTROPH_LIVE_STORAGE_PROVIDER: github-rest
+      SYNTROPH_LIVE_GITHUB_REPOSITORY: ${{ vars.SYNTROPH_LIVE_GITHUB_REPOSITORY }}
+      SYNTROPH_LIVE_RUN_ID: ${{ inputs.run_id }}
+      SYNTROPH_GITHUB_TOKEN: ${{ secrets.SYNTROPH_LIVE_GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify explicit live provider
+        run: go test -tags=livegithub ./integration/livegithub -run '^TestConfiguredGitHubStorageProvider$' -count=1 -v
+
+  wiki:
+    if: inputs.provider == 'github-wiki-git'
+    environment: live-storage-smoke
+    runs-on: ${{ vars.SYNTROPH_LIVE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    env:
+      SYNTROPH_LIVE_GITHUB_CONFIRM: I_UNDERSTAND_THIS_CREATES_PERSISTENT_GITHUB_RESOURCES
+      SYNTROPH_LIVE_STORAGE_PROVIDER: github-wiki-git
+      SYNTROPH_LIVE_GITHUB_REPOSITORY: ${{ vars.SYNTROPH_LIVE_GITHUB_REPOSITORY }}
+      SYNTROPH_LIVE_RUN_ID: ${{ inputs.run_id }}
+      SYNTROPH_LIVE_WIKI_REMOTE_URL: ${{ vars.SYNTROPH_LIVE_WIKI_REMOTE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify explicit live provider
+        run: go test -tags=livegithub ./integration/livegithub -run '^TestConfiguredGitHubStorageProvider$' -count=1 -v
+
+  mcp:
+    if: inputs.provider == 'github-mcp'
+    environment: live-storage-smoke
+    runs-on: ${{ vars.SYNTROPH_LIVE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    env:
+      SYNTROPH_LIVE_GITHUB_CONFIRM: I_UNDERSTAND_THIS_CREATES_PERSISTENT_GITHUB_RESOURCES
+      SYNTROPH_LIVE_STORAGE_PROVIDER: github-mcp
+      SYNTROPH_LIVE_GITHUB_REPOSITORY: ${{ vars.SYNTROPH_LIVE_GITHUB_REPOSITORY }}
+      SYNTROPH_LIVE_RUN_ID: ${{ inputs.run_id }}
+      SYNTROPH_LIVE_MCP_COMMAND_JSON: ${{ secrets.SYNTROPH_LIVE_MCP_COMMAND_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify explicit live provider
+        run: go test -tags=livegithub ./integration/livegithub -run '^TestConfiguredGitHubStorageProvider$' -count=1 -v
