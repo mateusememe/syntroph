@@ -61,6 +61,19 @@ func (a Adapter) Resolve(ctx context.Context, d core.SessionDiary, choice, obser
 	}
 }
 
+func (a Adapter) BeginCommand() {
+	if lifecycle, ok := a.Provider.(interface{ BeginCommand() }); ok {
+		lifecycle.BeginCommand()
+	}
+}
+
+func (a Adapter) EndCommand() error {
+	if lifecycle, ok := a.Provider.(interface{ EndCommand() error }); ok {
+		return lifecycle.EndCommand()
+	}
+	return nil
+}
+
 var _ core.StoragePort = Adapter{}
 var _ core.EventAwareStoragePort = Adapter{}
 var _ core.StoragePreflightPort = Adapter{}

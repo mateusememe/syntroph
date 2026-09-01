@@ -167,14 +167,25 @@ func wikiRemoteURL(origin string, resolved config.ResolvedStorage) string {
 }
 
 func concreteStorageProvider(resolved config.ResolvedStorage, root string, getenv func(string) string) storageadapter.Provider {
-	if resolved.Provider != config.ProviderGitHubREST {
+	storageRoot := filepath.Join(root, "storage")
+	var remote interface {
+		Mirror(context.Context, storage.SessionDiary) storage.MirrorResult
+		Status(context.Context, storage.SessionDiary) storage.MirrorResult
+		Resolve(context.Context, storage.SessionDiary, storage.Resolution, string) storage.MirrorResult
+	}
+	var err error
+	switch resolved.Provider {
+	case config.ProviderGitHubREST:
+		remote, err = githubissues.New(resolved.Repository, getenv(storage.GitHubTokenEnvironment), storageRoot, githubissues.Options{})
+	case config.ProviderGitHubMCP:
+		remote, err = githubissues.NewMCP(resolved.Repository, resolved.MCP.Command, storageRoot, githubissues.MCPOptions{})
+	default:
 		return nil
 	}
-	remote, err := githubissues.New(resolved.Repository, getenv(storage.GitHubTokenEnvironment), filepath.Join(root, "storage"), githubissues.Options{})
 	if err != nil {
 		return failedStorageProvider{backend: storage.BackendIssues, provider: resolved.Provider, cause: err}
 	}
-	managed, err := storage.NewManagedMirror(filepath.Join(root, "storage"), resolved.Provider, remote)
+	managed, err := storage.NewManagedMirror(storageRoot, resolved.Provider, remote)
 	if err != nil {
 		return failedStorageProvider{backend: storage.BackendIssues, provider: resolved.Provider, cause: err}
 	}

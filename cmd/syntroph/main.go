@@ -181,7 +181,30 @@ func retry(args []string, journal *core.SagaJournal, journalDir string, out inte
 	if err != nil {
 		return err
 	}
+	var storagePort core.StoragePort
+	var storageLifecycle interface {
+		BeginCommand()
+		EndCommand() error
+	}
+	storageLifecycleEnded := false
+	if scope == "storage" {
+		syntrophRoot := filepath.Dir(journalDir)
+		storagePort = configuredStorage(syntrophRoot, filepath.Dir(syntrophRoot))
+		if lifecycle, ok := storagePort.(interface {
+			BeginCommand()
+			EndCommand() error
+		}); ok {
+			storageLifecycle = lifecycle
+			storageLifecycle.BeginCommand()
+			defer func() {
+				if !storageLifecycleEnded {
+					_ = storageLifecycle.EndCommand()
+				}
+			}()
+		}
+	}
 	count := 0
+	var storageItems []core.RecoveryItem
 	for _, item := range items {
 		if (scope == "graph" && item.State != core.GraphResolutionPending && item.State != core.GraphSyncPending) || (scope == "storage" && item.State != "StorageSyncPending" && item.State != "StoragePrerequisiteMissing") {
 			continue
@@ -202,7 +225,8 @@ func retry(args []string, journal *core.SagaJournal, journalDir string, out inte
 				return err
 			}
 		} else {
-			result, retryErr := retryStorage(context.Background(), journal, journalDir, item)
+			storageItems = append(storageItems, item)
+			result, retryErr := retryStorage(context.Background(), journal, item, storagePort)
 			if retryErr != nil {
 				if appendErr := journal.AppendAttempt(context.Background(), core.HandlerAttempt{EventID: e.EventID, SagaID: item.SagaID, HandlerID: "storage-retry", AttemptedAt: time.Now().UTC(), Outcome: "failed", Error: retryErr.Error()}); appendErr != nil {
 					return appendErr
@@ -226,6 +250,18 @@ func retry(args []string, journal *core.SagaJournal, journalDir string, out inte
 		}
 		count++
 	}
+	if storageLifecycle != nil {
+		closeErr := storageLifecycle.EndCommand()
+		storageLifecycleEnded = true
+		if closeErr != nil {
+			for _, item := range storageItems {
+				if err := journalStorageShutdownFailure(context.Background(), journal, item, closeErr); err != nil {
+					return err
+				}
+			}
+			fmt.Fprintf(out, "MCP shutdown failed after the storage retry and was journaled for %d saga(s): %v\n", len(storageItems), closeErr)
+		}
+	}
 	fmt.Fprintf(out, "Retry requested for %s synchronization for %d saga(s). External effects require the configured adapter.\n", scope, count)
 	return nil
 }
@@ -246,19 +282,38 @@ func diaryFromSaga(ctx context.Context, journal *core.SagaJournal, saga string) 
 	return core.SessionDiary{}, errors.New("session diary not found in saga journal")
 }
 
-func retryStorage(ctx context.Context, journal *core.SagaJournal, journalDir string, item core.RecoveryItem) (core.StorageResult, error) {
+func retryStorage(ctx context.Context, journal *core.SagaJournal, item core.RecoveryItem, port core.StoragePort) (core.StorageResult, error) {
 	diary, err := diaryFromSaga(ctx, journal, item.SagaID)
 	if err != nil {
 		return core.StorageResult{}, err
 	}
-	syntrophRoot := filepath.Dir(journalDir)
-	port := configuredStorage(syntrophRoot, filepath.Dir(syntrophRoot))
 	resolver, ok := port.(core.EventAwareStoragePort)
 	if !ok || resolver == nil {
 		return core.StorageResult{}, errors.New("storage adapter is not configured")
 	}
 	r := resolver.MirrorEvent(ctx, item.SagaID+":storage-retry", diary)
 	return r, nil
+}
+
+func journalStorageShutdownFailure(ctx context.Context, journal *core.SagaJournal, item core.RecoveryItem, cause error) error {
+	now := time.Now().UTC()
+	eventID := fmt.Sprintf("%s:storage-shutdown:%d", item.SagaID, now.UnixNano())
+	attempt := core.HandlerAttempt{EventID: eventID, SagaID: item.SagaID, HandlerID: "storage-shutdown", AttemptedAt: now, Outcome: "failed", Error: cause.Error()}
+	if err := journal.AppendAttempt(ctx, attempt); err != nil {
+		return err
+	}
+	result := core.StorageResult{
+		EventID: eventID, State: string(storage.StorageSyncPending), Backend: item.Backend,
+		Provider: item.Provider, Key: item.IdempotencyKey, RemoteID: item.RemoteID,
+		RemoteURL: item.RemoteURL, RemoteRev: item.RemoteRevision,
+		FailureClass: string(storage.FailureTransient), Error: cause.Error(), Cause: cause,
+	}
+	payload, _ := json.Marshal(result)
+	return journal.AppendEvent(ctx, core.Event{
+		EventID: eventID, Type: "storage.sync.pending", OccurredAt: now,
+		RepositoryID: item.RepositoryID, SagaID: item.SagaID, CorrelationID: item.SagaID,
+		CausationID: item.EventID, SchemaVersion: 1, Payload: payload,
+	})
 }
 
 func storageResultEventType(state string) string {

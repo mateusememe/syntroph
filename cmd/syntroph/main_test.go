@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mateusememe/syntroph/adapters/githubissues"
 	"github.com/mateusememe/syntroph/adapters/githubwiki"
 	"github.com/mateusememe/syntroph/adapters/storageadapter"
 	"github.com/mateusememe/syntroph/config"
@@ -25,6 +28,19 @@ type countingStorageProvider struct {
 	resolveRevision  string
 	mirrorResult     storage.MirrorResult
 	resolutionResult storage.MirrorResult
+}
+
+type lifecycleStorageProvider struct {
+	countingStorageProvider
+	beginCalls int
+	endCalls   int
+	endErr     error
+}
+
+func (p *lifecycleStorageProvider) BeginCommand() { p.beginCalls++ }
+func (p *lifecycleStorageProvider) EndCommand() error {
+	p.endCalls++
+	return p.endErr
 }
 
 func (p *countingStorageProvider) Mirror(_ context.Context, diary storage.SessionDiary) storage.MirrorResult {
@@ -227,6 +243,21 @@ func TestDoctorStorageReportsMCPAndWikiProcessGuidance(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestConcreteStorageProviderBuildsGitHubMCPFromResolvedYAML(t *testing.T) {
+	root := t.TempDir()
+	provider := concreteStorageProvider(config.ResolvedStorage{
+		Backend: config.BackendIssues, Provider: config.ProviderGitHubMCP,
+		Repository: "mateusememe/syntroph", MCP: config.MCPConfig{Command: []string{"github-mcp-server", "stdio", "--toolsets=issues,labels"}},
+	}, root, func(string) string { return "must-not-be-read" })
+	managed, ok := provider.(*storage.ManagedMirror)
+	if !ok {
+		t.Fatalf("provider = %T, want managed mirror", provider)
+	}
+	if _, ok := managed.Remote.(*githubissues.MCPProvider); !ok {
+		t.Fatalf("remote = %T, want MCP provider", managed.Remote)
+	}
 }
 
 func TestSessionCloseInvalidStorageConfigKeepsLocalDiaryAndPerformsZeroProviderWrites(t *testing.T) {
@@ -525,6 +556,55 @@ func TestStorageRetryReplaysPrerequisiteFailureAndJournalsBindingResult(t *testi
 	}
 	if !foundBindingResult {
 		t.Fatal("retry journal omitted the provider binding result")
+	}
+}
+
+func TestStorageRetryUsesOneProviderLifecycleForAllSagasAndJournalsShutdownFailure(t *testing.T) {
+	_, root := configuredTestRepository(t, "storage:\n  backend: issues\n  provider: github-mcp\n  mcp:\n    command: [\"true\"]\n")
+	provider := &lifecycleStorageProvider{
+		countingStorageProvider: countingStorageProvider{mirrorResult: storage.MirrorResult{
+			State: storage.Mirrored, Backend: storage.BackendIssues, Provider: "github-mcp",
+			RemoteID: "41", RemoteURL: "https://github.test/issues/41",
+			RemoteRev: "issue:41:2026-08-31T12:00:00Z:" + strings.Repeat("b", 64),
+			LocalHash: strings.Repeat("a", 64), EffectiveRemoteHash: strings.Repeat("a", 64),
+		}},
+		endErr: errors.New("MCP process did not exit after stdin closed"),
+	}
+	previous := storageProviderBuilder
+	storageProviderBuilder = func(config.ResolvedStorage) storageadapter.Provider { return provider }
+	t.Cleanup(func() { storageProviderBuilder = previous })
+
+	journal, err := core.NewSagaJournal(filepath.Join(root, "journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"retry-mcp-one", "retry-mcp-two"} {
+		diary := recoveryTestDiary(id)
+		diary.ArtifactHash = fmt.Sprintf("%064s", id)
+		appendSessionAndStorageResult(t, journal, diary, core.StorageResult{
+			State: "StorageSyncPending", Backend: "issues", Provider: "github-mcp",
+			Key: diary.IdempotencyKey, FailureClass: "transient", Error: "previous failure",
+		})
+	}
+
+	var out bytes.Buffer
+	if err := run([]string{"sync", "--journal=" + filepath.Join(root, "journal"), "retry", "--storage"}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if provider.beginCalls != 1 || provider.endCalls != 1 || provider.mirrorCalls != 2 {
+		t.Fatalf("lifecycle begin=%d end=%d mirrors=%d", provider.beginCalls, provider.endCalls, provider.mirrorCalls)
+	}
+	if !strings.Contains(out.String(), "shutdown failed") || !strings.Contains(out.String(), "2 saga(s)") {
+		t.Fatalf("retry output omitted journaled shutdown failure: %s", out.String())
+	}
+	items, err := core.InspectRecovery(context.Background(), journal)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("shutdown failure recovery items=%+v err=%v", items, err)
+	}
+	for _, item := range items {
+		if item.State != "StorageSyncPending" || item.FailureClass != "transient" || !strings.Contains(item.LastError, "did not exit") {
+			t.Fatalf("shutdown failure was not projected: %+v", item)
+		}
 	}
 }
 

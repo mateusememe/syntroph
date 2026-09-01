@@ -66,10 +66,14 @@ storage:
   backend: issues
   provider: github-mcp
   mcp:
-    command: ["your-github-mcp-server", "stdio"]
+    command: ["github-mcp-server", "stdio", "--toolsets=issues,labels"]
 ```
 
-The configured MCP process owns its authentication. A session already open in Codex or Claude is not automatically reusable by the separate Syntroph CLI process. `syntroph doctor storage` verifies the configured executable without starting it.
+The configured MCP process owns its authentication. Configure it for non-interactive authentication through its own environment, GitHub App, or authenticated wrapper; never put a token in `.syntroph/config.yaml`. A session already open in Codex or Claude is not automatically reusable by the separate Syntroph CLI process.
+
+The `issues,labels` toolsets are both required. Before the first remote effect, Syntroph starts the configured executable directly (never through a shell), negotiates MCP, paginates `tools/list`, and validates schemas for label read/write, Issue read/create/update, comments, and labeled Issue listing. Missing tools or read-only mode become `StoragePrerequisiteMissing` and create no Issue. `syntroph doctor storage` verifies the executable without starting it; the capability check occurs when a confirmed mirror or retry starts, so doctor never opens an interactive login flow.
+
+Syntroph starts one stdio process for the complete mirror operation, reuses it for every MCP tool call, and closes its stdin when the operation finishes. HTTP MCP endpoints and hidden daemons are not supported.
 
 ### GitHub Wiki through Git
 

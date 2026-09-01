@@ -39,6 +39,8 @@ Session artifacts are structured Markdown or JSON. A manual `--summary` fallback
 
 Repository configuration uses `.syntroph/config.yaml` exclusively. Run `syntroph doctor storage` after cloning to validate the selected provider, normalized destination, and local prerequisites without authenticating or writing remotely. See [Installation](INSTALL.md#github-mirroring) for safe examples.
 
+The `github-mcp` Issues provider uses one explicitly configured stdio process per Syntroph operation. Its server must own non-interactive authentication and expose both the `issues` and `labels` toolsets; Syntroph validates the complete tool schema before any remote write.
+
 ## Selected engineering skills
 
 Syntroph tracks `code-review`, `codebase-design`, `diagnosing-bugs`, `domain-modeling`, `grill-me`, `grill-with-docs`, `grilling`, `implement`, `improve-codebase-architecture`, `research`, `tdd`, `to-spec`, `to-tickets`, `triage`, `wait-what`, and `implement-spec` from [`mattpocock/skills`](https://github.com/mattpocock/skills).

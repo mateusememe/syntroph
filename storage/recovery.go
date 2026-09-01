@@ -365,6 +365,21 @@ func (m *ManagedMirror) Resolve(ctx context.Context, diary SessionDiary, choice 
 	return m.run(ctx, diary, func() MirrorResult { return m.Remote.Resolve(ctx, diary, choice, observedRevision) })
 }
 
+// BeginCommand and EndCommand forward an optional provider lifecycle used by
+// transports such as MCP that must reuse one child process for a batch command.
+func (m *ManagedMirror) BeginCommand() {
+	if lifecycle, ok := m.Remote.(interface{ BeginCommand() }); ok {
+		lifecycle.BeginCommand()
+	}
+}
+
+func (m *ManagedMirror) EndCommand() error {
+	if lifecycle, ok := m.Remote.(interface{ EndCommand() error }); ok {
+		return lifecycle.EndCommand()
+	}
+	return nil
+}
+
 func (m *ManagedMirror) run(ctx context.Context, diary SessionDiary, effect func() MirrorResult) MirrorResult {
 	key := diary.Key()
 	lock, err := m.Locks.Acquire(ctx, key)
