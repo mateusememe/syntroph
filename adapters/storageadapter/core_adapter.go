@@ -3,6 +3,7 @@ package storageadapter
 
 import (
 	"context"
+	"errors"
 
 	"github.com/mateusememe/syntroph/core"
 	"github.com/mateusememe/syntroph/storage"
@@ -11,6 +12,10 @@ import (
 type Provider interface {
 	Mirror(context.Context, storage.SessionDiary) storage.MirrorResult
 	Resolve(context.Context, storage.SessionDiary, storage.Resolution, string) storage.MirrorResult
+}
+
+type RecoveryProvider interface {
+	Recover(context.Context, storage.SessionDiary) storage.MirrorResult
 }
 
 type Adapter struct {
@@ -35,30 +40,29 @@ func (a Adapter) Mirror(ctx context.Context, d core.SessionDiary) core.StorageRe
 }
 func (a Adapter) MirrorEvent(ctx context.Context, eventID string, d core.SessionDiary) core.StorageResult {
 	if a.Provider == nil {
-		return core.StorageResult{EventID: eventID, State: string(storage.StorageSyncPending), Backend: a.Backend, Provider: a.ProviderID, Cause: storage.ErrUnavailable}
+		return core.StorageResult{EventID: eventID, State: storage.StorageSyncPending, Backend: core.StorageBackend(a.Backend), Provider: a.ProviderID, Cause: storage.ErrUnavailable}
 	}
 	r := a.Provider.Mirror(ctx, storage.SessionDiary{SessionID: d.SessionID, RepositoryID: d.RepositoryID, CommitSHA: d.CommitSHA, ArtifactHash: d.ArtifactHash, Content: core.RenderSessionDiary(d)})
-	return core.StorageResult{
-		EventID: eventID, State: string(r.State), Backend: string(r.Backend), Provider: r.Provider,
-		Key: r.Key, RemoteID: r.RemoteID, RemoteURL: r.RemoteURL, RemoteRev: r.RemoteRev,
-		ExpectedRev: r.ExpectedRev, LocalHash: r.LocalHash, EffectiveRemoteHash: r.EffectiveRemoteHash,
-		FailureClass: string(r.FailureClass), ConflictSnapshot: r.ConflictSnapshot,
-		AlreadyInProgress: r.AlreadyInProgress, Cause: r.Cause,
-	}
+	r.EventID = eventID
+	return r
 }
 
 func (a Adapter) Resolve(ctx context.Context, d core.SessionDiary, choice, observedRevision string) core.StorageResult {
 	if a.Provider == nil {
-		return core.StorageResult{State: string(storage.StorageSyncPending), Backend: a.Backend, Provider: a.ProviderID, Cause: storage.ErrUnavailable}
+		return core.StorageResult{State: storage.StorageSyncPending, Backend: core.StorageBackend(a.Backend), Provider: a.ProviderID, Cause: storage.ErrUnavailable}
 	}
 	r := a.Provider.Resolve(ctx, storage.SessionDiary{SessionID: d.SessionID, RepositoryID: d.RepositoryID, CommitSHA: d.CommitSHA, ArtifactHash: d.ArtifactHash, Content: core.RenderSessionDiary(d)}, storage.Resolution(choice), observedRevision)
-	return core.StorageResult{
-		State: string(r.State), Backend: string(r.Backend), Provider: r.Provider,
-		Key: r.Key, RemoteID: r.RemoteID, RemoteURL: r.RemoteURL, RemoteRev: r.RemoteRev,
-		ExpectedRev: r.ExpectedRev, LocalHash: r.LocalHash, EffectiveRemoteHash: r.EffectiveRemoteHash,
-		FailureClass: string(r.FailureClass), ConflictSnapshot: r.ConflictSnapshot,
-		AlreadyInProgress: r.AlreadyInProgress, Cause: r.Cause,
+	return r
+}
+
+func (a Adapter) RecoverEvent(ctx context.Context, eventID string, d core.SessionDiary) core.StorageResult {
+	provider, ok := a.Provider.(RecoveryProvider)
+	if !ok || provider == nil {
+		return core.StorageResult{EventID: eventID, State: storage.StorageSyncPending, Backend: core.StorageBackend(a.Backend), Provider: a.ProviderID, Key: d.IdempotencyKey, FailureClass: storage.FailureTransient, Cause: errors.New("configured storage provider does not support explicit recovery")}
 	}
+	r := provider.Recover(ctx, storage.SessionDiary{SessionID: d.SessionID, RepositoryID: d.RepositoryID, CommitSHA: d.CommitSHA, ArtifactHash: d.ArtifactHash, Content: core.RenderSessionDiary(d)})
+	r.EventID = eventID
+	return r
 }
 
 func (a Adapter) BeginCommand() {
@@ -76,4 +80,5 @@ func (a Adapter) EndCommand() error {
 
 var _ core.StoragePort = Adapter{}
 var _ core.EventAwareStoragePort = Adapter{}
+var _ core.StorageRecoveryPort = Adapter{}
 var _ core.StoragePreflightPort = Adapter{}

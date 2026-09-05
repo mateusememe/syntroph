@@ -12,69 +12,17 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/mateusememe/syntroph/core/storagecontract"
 )
 
 // RemoteRevision is opaque to Core. Storage providers own the shape of their
 // revisions and must use one of the documented provider-typed forms.
-type RemoteRevision string
-
-func (r RemoteRevision) Validate() error {
-	value := string(r)
-	if strings.HasPrefix(value, "git:") {
-		if isHex(strings.TrimPrefix(value, "git:"), 7) {
-			return nil
-		}
-		return errors.New("git remote revision requires a commit SHA")
-	}
-	for _, prefix := range []string{"issue:", "comment:"} {
-		if !strings.HasPrefix(value, prefix) {
-			continue
-		}
-		body := strings.TrimPrefix(value, prefix)
-		first, last := strings.IndexByte(body, ':'), strings.LastIndexByte(body, ':')
-		if first <= 0 || last <= first+1 || last == len(body)-1 || !isSHA256(body[last+1:]) {
-			return fmt.Errorf("%s remote revision requires id, observed time, and body hash", strings.TrimSuffix(prefix, ":"))
-		}
-		return nil
-	}
-	return fmt.Errorf("unsupported remote revision %q", value)
-}
+type RemoteRevision = storagecontract.RemoteRevision
 
 // RemoteBinding is the current operational projection of one immutable diary.
 // It intentionally stores hashes rather than remote content.
-type RemoteBinding struct {
-	IdempotencyKey      string         `json:"idempotency_key"`
-	Backend             Backend        `json:"backend"`
-	Provider            string         `json:"provider"`
-	RemoteID            string         `json:"remote_id"`
-	URL                 string         `json:"url"`
-	RemoteRevision      RemoteRevision `json:"remote_revision"`
-	LocalHash           string         `json:"local_hash"`
-	EffectiveRemoteHash string         `json:"effective_remote_hash"`
-	UpdatedAt           time.Time      `json:"updated_at"`
-}
-
-func (b RemoteBinding) Validate() error {
-	if !isSHA256(b.IdempotencyKey) {
-		return errors.New("remote binding requires a SHA-256 idempotency key")
-	}
-	if b.Backend != BackendWiki && b.Backend != BackendIssues {
-		return errors.New("remote binding requires a supported backend")
-	}
-	if b.Provider == "" || b.RemoteID == "" || b.URL == "" {
-		return errors.New("remote binding requires provider, remote ID, and URL")
-	}
-	if err := b.RemoteRevision.Validate(); err != nil {
-		return err
-	}
-	if !isSHA256(b.LocalHash) || !isSHA256(b.EffectiveRemoteHash) {
-		return errors.New("remote binding requires SHA-256 local and effective remote hashes")
-	}
-	if b.UpdatedAt.IsZero() {
-		return errors.New("remote binding requires updated_at")
-	}
-	return nil
-}
+type RemoteBinding = storagecontract.Binding
 
 // BindingStore atomically maintains the current Remote Binding projection.
 type BindingStore struct{ root string }
@@ -352,7 +300,38 @@ func NewManagedMirror(root, provider string, remote interface {
 }
 
 func (m *ManagedMirror) Mirror(ctx context.Context, diary SessionDiary) MirrorResult {
-	return m.run(ctx, diary, func() MirrorResult { return m.Remote.Mirror(ctx, diary) })
+	return m.run(ctx, diary, func() MirrorResult {
+		_, bound, err := m.Bindings.Load(ctx, diary.Key())
+		if err != nil {
+			return MirrorResult{Key: diary.Key(), State: StorageSyncPending, FailureClass: FailureTransient, Cause: err}
+		}
+		if !bound {
+			if creator, ok := m.Remote.(interface {
+				Create(context.Context, SessionDiary) MirrorResult
+			}); ok {
+				return creator.Create(ctx, diary)
+			}
+		}
+		if bound {
+			if boundMirror, ok := m.Remote.(interface {
+				MirrorBound(context.Context, SessionDiary) MirrorResult
+			}); ok {
+				return boundMirror.MirrorBound(ctx, diary)
+			}
+		}
+		return m.Remote.Mirror(ctx, diary)
+	})
+}
+
+func (m *ManagedMirror) Recover(ctx context.Context, diary SessionDiary) MirrorResult {
+	return m.run(ctx, diary, func() MirrorResult {
+		if recovery, ok := m.Remote.(interface {
+			Recover(context.Context, SessionDiary) MirrorResult
+		}); ok {
+			return recovery.Recover(ctx, diary)
+		}
+		return MirrorResult{Key: diary.Key(), State: StorageSyncPending, FailureClass: FailureTransient, Cause: errors.New("remote provider does not support explicit recovery")}
+	})
 }
 
 func (m *ManagedMirror) Status(ctx context.Context, diary SessionDiary) MirrorResult {

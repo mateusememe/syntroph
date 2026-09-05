@@ -72,6 +72,21 @@ func TestResolveStorageAllowsExplicitCrossRepositoryOptIn(t *testing.T) {
 	}
 }
 
+func TestNormalizeGitHubRepositoryRejectsEmbeddedCredentials(t *testing.T) {
+	for _, remote := range []string{
+		"https://alice:super-secret@github.com/mateusememe/syntroph.git",
+		"alice:super-secret@github.com:mateusememe/syntroph.git",
+	} {
+		_, err := config.NormalizeGitHubRepository(remote)
+		if err == nil || strings.Contains(err.Error(), "super-secret") {
+			t.Fatalf("remote %q was not rejected safely: %v", remote, err)
+		}
+	}
+	if got, err := config.NormalizeGitHubRepository("ssh://git@github.com/mateusememe/syntroph.git"); err != nil || got != "mateusememe/syntroph" {
+		t.Fatalf("credential-free SSH remote rejected: got=%q err=%v", got, err)
+	}
+}
+
 func TestLoadRejectsJSONAndUnknownYAMLFields(t *testing.T) {
 	for _, contents := range []string{
 		`{"storage":{"backend":"issues","provider":"github-rest"}}`,

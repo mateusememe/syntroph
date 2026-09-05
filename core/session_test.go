@@ -15,6 +15,17 @@ type preflightStorage struct {
 	mirrorCalls int
 }
 
+type crashAfterRemoteEffectStorage struct{ effected bool }
+
+func (s *crashAfterRemoteEffectStorage) Preflight(context.Context) StoragePreflightResult {
+	return StoragePreflightResult{Ready: true, Backend: "issues", Provider: "github-rest"}
+}
+
+func (s *crashAfterRemoteEffectStorage) Mirror(context.Context, SessionDiary) StorageResult {
+	s.effected = true
+	panic("simulated process crash after remote effect")
+}
+
 func (s *preflightStorage) Preflight(context.Context) StoragePreflightResult {
 	if s.ready {
 		return StoragePreflightResult{Ready: true, Backend: "issues", Provider: "github-rest", Repository: "mateusememe/syntroph"}
@@ -131,11 +142,46 @@ func TestSessionClosePersistsDiaryAndPrerequisiteBeforeSkippingMirror(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 3 || records[0].Event == nil || records[0].Event.Type != "session.closed" || records[2].Event == nil || records[2].Event.Type != "storage.prerequisite.missing" {
+	if len(records) != 4 || records[0].Event == nil || records[0].Event.Type != "session.closed" || records[1].Event == nil || records[1].Event.Type != "storage.sync.requested" || records[3].Event == nil || records[3].Event.Type != "storage.prerequisite.missing" {
 		t.Fatalf("unexpected durable preflight sequence: %+v", records)
 	}
 	items, err := InspectRecovery(context.Background(), journal)
 	if err != nil || len(items) != 1 || items[0].State != "StoragePrerequisiteMissing" || items[0].NextAction != "syntroph doctor storage" {
 		t.Fatalf("unexpected recovery view: %+v err=%v", items, err)
+	}
+}
+
+func TestCrashAfterRemoteEffectLeavesDurableStorageIntentPending(t *testing.T) {
+	root := t.TempDir()
+	journal, err := NewSagaJournal(filepath.Join(root, "journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus, err := NewEventBus(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &crashAfterRemoteEffectStorage{}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected simulated crash")
+			}
+		}()
+		_, _, _ = (SessionCloser{Memory: LocalMemoryStore{Root: filepath.Join(root, "memory")}, Bus: bus, Storage: remote}).Close(context.Background(), SessionCloseRequest{
+			RepositoryID: "github.com/mateusememe/syntroph", CommitSHA: "crash-sha", Author: "matt",
+			Format: ArtifactJSON, Artifact: []byte(`{"summary":"durable intent"}`),
+		})
+	}()
+	if !remote.effected {
+		t.Fatal("simulated remote effect did not execute")
+	}
+	items, err := InspectRecovery(context.Background(), journal)
+	if err != nil || len(items) != 1 || items[0].State != string(StorageSyncPending) || items[0].NextAction != "syntroph sync retry --storage" {
+		t.Fatalf("interrupted intent was not recoverable: items=%+v err=%v", items, err)
+	}
+	records, err := journal.ReadSaga(context.Background(), items[0].SagaID)
+	if err != nil || len(records) != 2 || records[1].Event == nil || records[1].Event.Type != "storage.sync.requested" {
+		t.Fatalf("intent was not durable before effect: records=%+v err=%v", records, err)
 	}
 }

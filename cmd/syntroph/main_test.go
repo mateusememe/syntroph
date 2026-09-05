@@ -53,6 +53,10 @@ func (p *countingStorageProvider) Mirror(_ context.Context, diary storage.Sessio
 	return storage.MirrorResult{State: storage.Mirrored, Backend: storage.BackendIssues, Provider: "test-provider", Key: diary.Key()}
 }
 
+func (p *countingStorageProvider) Recover(ctx context.Context, diary storage.SessionDiary) storage.MirrorResult {
+	return p.Mirror(ctx, diary)
+}
+
 func (p *countingStorageProvider) Resolve(_ context.Context, _ storage.SessionDiary, choice storage.Resolution, revision string) storage.MirrorResult {
 	p.resolveCalls++
 	p.resolveChoice, p.resolveRevision = choice, revision
@@ -671,7 +675,7 @@ func appendSessionAndStorageResult(t *testing.T, journal *core.SagaJournal, diar
 		t.Fatal(err)
 	}
 	payload, _ = json.Marshal(result)
-	if err := journal.AppendEvent(context.Background(), core.Event{EventID: diary.SessionID + ":storage", Type: storageResultEventType(result.State), OccurredAt: diary.CreatedAt, RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: diary.SessionID, SchemaVersion: 1, Payload: payload}); err != nil {
+	if err := journal.AppendEvent(context.Background(), core.Event{EventID: diary.SessionID + ":storage", Type: storageResultEventType(string(result.State)), OccurredAt: diary.CreatedAt, RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: diary.SessionID, SchemaVersion: 1, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
 }

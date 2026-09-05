@@ -209,27 +209,14 @@ type EventAwareStoragePort interface {
 	MirrorEvent(context.Context, string, SessionDiary) StorageResult
 }
 
-type StorageResolver interface {
-	Resolve(context.Context, SessionDiary, string, string) StorageResult
+// StorageRecoveryPort is the only Core path allowed to perform marker-based
+// discovery when the operational Remote Binding is missing.
+type StorageRecoveryPort interface {
+	RecoverEvent(context.Context, string, SessionDiary) StorageResult
 }
 
-type StorageResult struct {
-	EventID             string `json:"event_id,omitempty"`
-	State               string `json:"state"`
-	Backend             string `json:"backend,omitempty"`
-	Provider            string `json:"provider,omitempty"`
-	Key                 string `json:"idempotency_key,omitempty"`
-	RemoteID            string `json:"remote_id,omitempty"`
-	RemoteURL           string `json:"remote_url,omitempty"`
-	RemoteRev           string `json:"remote_revision,omitempty"`
-	ExpectedRev         string `json:"expected_revision,omitempty"`
-	LocalHash           string `json:"local_hash,omitempty"`
-	EffectiveRemoteHash string `json:"effective_remote_hash,omitempty"`
-	FailureClass        string `json:"failure_class,omitempty"`
-	ConflictSnapshot    string `json:"conflict_snapshot,omitempty"`
-	AlreadyInProgress   bool   `json:"already_in_progress,omitempty"`
-	Error               string `json:"error,omitempty"`
-	Cause               error  `json:"-"`
+type StorageResolver interface {
+	Resolve(context.Context, SessionDiary, string, string) StorageResult
 }
 
 type SessionCloser struct {
@@ -314,14 +301,15 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 		return diary, delivery, err
 	}
 
-	// The session.closed event is durable before the first remote effect. A
-	// restart therefore observes the canonical diary and never infers that it
-	// should replay storage automatically.
+	// A durable intent is appended before the first remote effect. A restart
+	// surfaces an interrupted mirror but never replays it automatically.
 	storageEventID := diary.SessionID + ":storage"
 	var storageResult StorageResult
 	preflightReady := true
+	intent := StorageResult{EventID: storageEventID, State: StorageSyncPending, Key: diary.IdempotencyKey, FailureClass: StorageFailureTransient}
 	if preflight, ok := c.Storage.(StoragePreflightPort); ok {
 		check := preflight.Preflight(ctx)
+		intent.Backend, intent.Provider = StorageBackend(check.Backend), check.Provider
 		preflightReady = check.Ready
 		if !check.Ready {
 			cause := check.Cause
@@ -330,9 +318,16 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 			}
 			storageResult = StorageResult{
 				EventID: storageEventID, State: "StoragePrerequisiteMissing",
-				Backend: check.Backend, Provider: check.Provider,
+				Backend: StorageBackend(check.Backend), Provider: check.Provider,
 				FailureClass: "prerequisite_missing", Error: cause.Error(), Cause: cause,
 			}
+		}
+	}
+	if journal, ok := c.Bus.journal.(*SagaJournal); ok {
+		intentPayload, _ := json.Marshal(intent)
+		intentEvent := Event{EventID: storageEventID, Type: "storage.sync.requested", OccurredAt: time.Now().UTC(), RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: e.EventID, SchemaVersion: 1, Payload: intentPayload}
+		if appendErr := journal.AppendEvent(ctx, intentEvent); appendErr != nil {
+			return diary, delivery, appendErr
 		}
 	}
 	if preflightReady {
@@ -344,8 +339,9 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 		}
 	}
 	if storageResult.Cause != nil && storageResult.Error == "" {
-		storageResult.Error = storageResult.Cause.Error()
+		storageResult.Error = SafeStorageDiagnostic(storageResult.Cause.Error())
 	}
+	storageResult.Error = SafeStorageDiagnostic(storageResult.Error)
 	if journal, ok := c.Bus.journal.(*SagaJournal); ok {
 		attempt := HandlerAttempt{EventID: storageEventID, SagaID: diary.SessionID, HandlerID: "storage-mirror", AttemptedAt: time.Now().UTC(), Outcome: "succeeded"}
 		if storageResult.State != "mirrored" {
@@ -361,7 +357,7 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 		// A concurrent attempt is diagnostic, not another pending obligation.
 		if !storageResult.AlreadyInProgress {
 			outcomePayload, _ := json.Marshal(storageResult)
-			storageEvent := Event{EventID: storageEventID, Type: storageEventType(storageResult.State), OccurredAt: time.Now().UTC(), RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: e.EventID, SchemaVersion: 1, Payload: outcomePayload}
+			storageEvent := Event{EventID: storageEventID + ":outcome", Type: storageEventType(string(storageResult.State)), OccurredAt: time.Now().UTC(), RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: storageEventID, SchemaVersion: 1, Payload: outcomePayload}
 			if appendErr := journal.AppendEvent(ctx, storageEvent); appendErr != nil {
 				return diary, delivery, appendErr
 			}

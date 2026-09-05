@@ -93,7 +93,7 @@ func TestMCPClientBoundsStderrAndReportsUnexpectedExit(t *testing.T) {
 	t.Setenv("GO_WANT_MCP_HELPER", "exit")
 	client, _ := newMCPClient(helperCommand(), MCPOptions{Timeout: time.Second, MaxStderrBytes: 32})
 	err := client.Negotiate(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "stderr:") || !strings.Contains(err.Error(), "truncated") {
+	if err == nil || !strings.Contains(err.Error(), "stderr:") || !strings.Contains(err.Error(), "truncated") || strings.Contains(err.Error(), "mcp-secret") {
 		t.Fatalf("unexpected exit error = %v", err)
 	}
 }
@@ -114,7 +114,7 @@ func TestMCPClientRejectsMalformedAndOversizedStdout(t *testing.T) {
 func TestMCPProviderMirrorsWithCanonicalOrderingAndRecoversLostBinding(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "storage")
 	state, logPath := filepath.Join(t.TempDir(), "remote.json"), filepath.Join(t.TempDir(), "calls.log")
-	t.Setenv("GO_WANT_MCP_HELPER", "provider")
+	t.Setenv("GO_WANT_MCP_HELPER", "provider-pagination")
 	t.Setenv("MCP_HELPER_STATE", state)
 	t.Setenv("MCP_HELPER_LOG", logPath)
 	remote, err := NewMCP("mateusememe/syntroph", helperCommand(), root, MCPOptions{Timeout: time.Second})
@@ -135,7 +135,7 @@ func TestMCPProviderMirrorsWithCanonicalOrderingAndRecoversLostBinding(t *testin
 	}
 	logData, _ := os.ReadFile(logPath)
 	logText := string(logData)
-	for _, ordered := range []string{"server/discover", "tools/list", "list_issues", "get_label", "label_write", "issue_write:create", "issue_write:update"} {
+	for _, ordered := range []string{"server/discover", "tools/list", "get_label", "label_write", "issue_write:create", "issue_write:update"} {
 		index := strings.Index(logText, ordered)
 		if index < 0 {
 			t.Fatalf("%s absent from MCP log:\n%s", ordered, logText)
@@ -144,6 +144,9 @@ func TestMCPProviderMirrorsWithCanonicalOrderingAndRecoversLostBinding(t *testin
 	}
 	if strings.Count(string(logData), "START ") != 1 {
 		t.Fatalf("mirror should reuse one process:\n%s", logData)
+	}
+	if strings.Contains(string(logData), "list_issues") {
+		t.Fatalf("normal mirror performed recovery discovery:\n%s", logData)
 	}
 
 	// Recovery search is deliberately exercised only after the operational
@@ -154,13 +157,16 @@ func TestMCPProviderMirrorsWithCanonicalOrderingAndRecoversLostBinding(t *testin
 	}
 	remote2, _ := NewMCP("mateusememe/syntroph", helperCommand(), root, MCPOptions{Timeout: time.Second})
 	managed2, _ := storage.NewManagedMirror(root, MCPProviderID, remote2)
-	result = managed2.Mirror(context.Background(), testDiary())
+	result = managed2.Recover(context.Background(), testDiary())
 	if result.State != storage.Mirrored || result.RemoteID != "42" {
 		t.Fatalf("recovered result = %+v", result)
 	}
 	logData, _ = os.ReadFile(logPath)
 	if strings.Count(string(logData), "issue_write:create") != 1 {
 		t.Fatalf("marker recovery duplicated issue:\n%s", logData)
+	}
+	if !strings.Contains(string(logData), "list_issues:after=page-2") {
+		t.Fatalf("recovery did not use the official list_issues after cursor:\n%s", logData)
 	}
 }
 
@@ -343,7 +349,7 @@ func TestMCPHelperProcess(t *testing.T) {
 		return
 	}
 	if scenario == "exit" {
-		fmt.Fprint(os.Stderr, strings.Repeat("diagnostic", 20))
+		fmt.Fprint(os.Stderr, "token=mcp-secret "+strings.Repeat("diagnostic", 20))
 		os.Exit(17)
 	}
 	if scenario == "malformed" {
@@ -460,6 +466,9 @@ func providerToolCall(params map[string]any) map[string]any {
 	arguments, _ := params["arguments"].(map[string]any)
 	method, _ := arguments["method"].(string)
 	logHelper(name + map[bool]string{true: ":" + method, false: ""}[method != ""])
+	if os.Getenv("GO_WANT_MCP_HELPER") == "provider-malformed-result" && name == "get_label" {
+		return map[string]any{"structuredContent": "not-an-object"}
+	}
 	state := readHelperState()
 	structured := func(value any) map[string]any { return map[string]any{"structuredContent": value} }
 	switch name {
@@ -484,6 +493,14 @@ func providerToolCall(params map[string]any) map[string]any {
 	case "list_issues":
 		if os.Getenv("GO_WANT_MCP_HELPER") == "provider-malformed-result" {
 			return map[string]any{"structuredContent": "not-an-object"}
+		}
+		after := stringArg(arguments, "after")
+		logHelper("list_issues:after=" + after)
+		if os.Getenv("GO_WANT_MCP_HELPER") == "provider-pagination" && after == "" {
+			page := issueListResult{}
+			page.PageInfo.HasNextPage = true
+			page.PageInfo.NextCursor = "page-2"
+			return structured(page)
 		}
 		stateName := stringArg(arguments, "state")
 		issues := []issue{}
@@ -524,7 +541,7 @@ func providerTools() map[string]map[string]any {
 		"issue_read":        schemaWithMethods([]string{"owner", "repo", "method", "issue_number"}, "get", "get_comments"),
 		"issue_write":       schemaWithMethods([]string{"owner", "repo", "method", "title", "body", "labels", "issue_number", "state", "state_reason"}, "create", "update"),
 		"add_issue_comment": schemaWithMethods([]string{"owner", "repo", "issue_number", "body"}),
-		"list_issues":       schemaWithMethods([]string{"owner", "repo", "state", "labels", "cursor"}),
+		"list_issues":       schemaWithMethods([]string{"owner", "repo", "state", "labels", "after"}),
 	}
 }
 

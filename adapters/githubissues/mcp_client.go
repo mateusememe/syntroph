@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mateusememe/syntroph/core/storagecontract"
 )
 
 const (
@@ -389,7 +391,7 @@ func (c *mcpClient) processError(err error) error {
 		detail = c.stderr.String()
 	}
 	if detail != "" {
-		return fmt.Errorf("MCP process: %w (stderr: %s)", err, detail)
+		return fmt.Errorf("MCP process: %w (stderr: %s)", err, storagecontract.SafeDiagnostic(detail))
 	}
 	return fmt.Errorf("MCP process: %w", err)
 }

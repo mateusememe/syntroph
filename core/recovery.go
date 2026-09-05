@@ -68,6 +68,14 @@ func InspectRecovery(ctx context.Context, journal *SagaJournal) ([]RecoveryItem,
 					}
 				}
 				switch record.Event.Type {
+				case "storage.sync.requested":
+					var result StorageResult
+					if json.Unmarshal(record.Event.Payload, &result) == nil {
+						if result.State == "" {
+							result.State = StorageSyncPending
+						}
+						storageResult, storageResolved = &result, false
+					}
 				case "storage.sync.succeeded", "storage.sync.resolved":
 					storageResolved = true
 					var result StorageResult
@@ -115,11 +123,11 @@ func InspectRecovery(ctx context.Context, journal *SagaJournal) ([]RecoveryItem,
 }
 
 func applyStorageRecovery(item *RecoveryItem, result StorageResult) {
-	item.State = result.State
+	item.State = string(result.State)
 	item.IdempotencyKey = firstNonEmpty(result.Key, item.IdempotencyKey)
-	item.Backend, item.Provider = result.Backend, result.Provider
+	item.Backend, item.Provider = string(result.Backend), result.Provider
 	item.RemoteID, item.RemoteURL, item.RemoteRevision = result.RemoteID, result.RemoteURL, result.RemoteRev
-	item.FailureClass, item.ConflictSnapshot = result.FailureClass, result.ConflictSnapshot
+	item.FailureClass, item.ConflictSnapshot = string(result.FailureClass), result.ConflictSnapshot
 	item.LastError = firstNonEmpty(result.Error, errorString(result.Cause))
 	switch result.State {
 	case "StorageSyncConflict":

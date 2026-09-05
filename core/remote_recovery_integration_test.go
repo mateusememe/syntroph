@@ -118,11 +118,11 @@ func TestSessionClosePersistsRemoteBindingJournalAndSurvivesRestart(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 3 || records[0].Event == nil || records[0].Event.Type != "session.closed" || records[1].Attempt == nil || records[2].Event == nil || records[2].Event.Type != "storage.sync.succeeded" {
+	if len(records) != 4 || records[0].Event == nil || records[0].Event.Type != "session.closed" || records[1].Event == nil || records[1].Event.Type != "storage.sync.requested" || records[2].Attempt == nil || records[3].Event == nil || records[3].Event.Type != "storage.sync.succeeded" {
 		t.Fatalf("unexpected durable sequence: %+v", records)
 	}
 	var evidence core.StorageResult
-	if err := json.Unmarshal(records[2].Event.Payload, &evidence); err != nil || evidence.RemoteID != binding.RemoteID || evidence.RemoteRev != string(binding.RemoteRevision) || evidence.LocalHash != binding.LocalHash {
+	if err := json.Unmarshal(records[3].Event.Payload, &evidence); err != nil || evidence.RemoteID != binding.RemoteID || evidence.RemoteRev != string(binding.RemoteRevision) || evidence.LocalHash != binding.LocalHash {
 		t.Fatalf("journal cannot rebuild binding: evidence=%+v err=%v", evidence, err)
 	}
 

@@ -168,8 +168,14 @@ func NormalizeGitHubRepository(value string) (string, error) {
 		if err != nil || !strings.EqualFold(u.Hostname(), "github.com") {
 			return "", errors.New("repository must be hosted on github.com")
 		}
+		if u.User != nil && !(strings.EqualFold(u.Scheme, "ssh") && u.User.Username() == "git" && !userinfoHasPassword(u)) {
+			return "", errors.New("Git remote URL must not contain userinfo or embedded credentials")
+		}
 		path = u.Path
 	} else if at := strings.Index(value, "@"); at >= 0 {
+		if !strings.HasPrefix(value, "git@") {
+			return "", errors.New("Git remote URL must not contain userinfo or embedded credentials")
+		}
 		colon := strings.Index(value[at:], ":")
 		if colon < 0 || !strings.EqualFold(value[at+1:at+colon], "github.com") {
 			return "", errors.New("repository must be hosted on github.com")
@@ -185,4 +191,9 @@ func NormalizeGitHubRepository(value string) (string, error) {
 		return "", fmt.Errorf("repository %q must be owner/name or a GitHub remote URL", value)
 	}
 	return parts[0] + "/" + parts[1], nil
+}
+
+func userinfoHasPassword(u *url.URL) bool {
+	_, ok := u.User.Password()
+	return ok
 }

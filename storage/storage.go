@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+
+	"github.com/mateusememe/syntroph/core/storagecontract"
 )
 
 var (
@@ -18,76 +20,35 @@ var (
 	ErrMirrorInProgress    = errors.New("storage mirror already in progress")
 )
 
-type Backend string
+type Backend = storagecontract.Backend
 
 const (
-	BackendWiki   Backend = "wiki"
-	BackendIssues Backend = "issues"
+	BackendWiki   = storagecontract.BackendWiki
+	BackendIssues = storagecontract.BackendIssues
 )
 
-type MirrorState string
+type MirrorState = storagecontract.State
 
 const (
-	Mirrored                   MirrorState = "mirrored"
-	StorageSyncPending         MirrorState = "StorageSyncPending"
-	StorageSyncConflict        MirrorState = "StorageSyncConflict"
-	StoragePrerequisiteMissing MirrorState = "StoragePrerequisiteMissing"
+	Mirrored                   = storagecontract.Mirrored
+	StorageSyncPending         = storagecontract.SyncPending
+	StorageSyncConflict        = storagecontract.SyncConflict
+	StoragePrerequisiteMissing = storagecontract.PrerequisiteMissing
 )
 
-type FailureClass string
+type FailureClass = storagecontract.FailureClass
 
 const (
-	FailureTransient         FailureClass = "transient"
-	FailureConflict          FailureClass = "conflict"
-	FailurePrerequisite      FailureClass = "prerequisite_missing"
-	FailureAlreadyInProgress FailureClass = "already_in_progress"
+	FailureTransient         = storagecontract.FailureTransient
+	FailureConflict          = storagecontract.FailureConflict
+	FailurePrerequisite      = storagecontract.FailurePrerequisite
+	FailureAlreadyInProgress = storagecontract.FailureAlreadyInProgress
 )
 
 // SessionDiary is the immutable local document handed to a mirror. Mirrors
 // must never mutate it or use the remote copy as the canonical source.
-type SessionDiary struct {
-	SessionID    string
-	RepositoryID string
-	CommitSHA    string
-	ArtifactHash string
-	Content      string
-}
-
-func (d SessionDiary) Validate() error {
-	if d.SessionID == "" || d.RepositoryID == "" || d.CommitSHA == "" || d.ArtifactHash == "" || d.Content == "" {
-		return errors.New("session diary is missing required fields")
-	}
-	return nil
-}
-
-func (d SessionDiary) Key() string {
-	sum := sha256.Sum256([]byte(d.RepositoryID + "\n" + d.CommitSHA + "\n" + d.ArtifactHash))
-	return hex.EncodeToString(sum[:])
-}
-
-type MirrorResult struct {
-	State               MirrorState
-	Backend             Backend
-	Provider            string
-	Key                 string
-	RemoteID            string
-	RemoteURL           string
-	RemoteRev           string
-	ExpectedRev         string
-	LocalHash           string
-	EffectiveRemoteHash string
-	RemoteContent       string
-	FailureClass        FailureClass
-	ConflictSnapshot    string
-	AlreadyInProgress   bool
-	// UnverifiedIdentity prevents recovery from reconstructing a binding when
-	// a deterministic remote location does not carry the exact Syntroph marker.
-	UnverifiedIdentity bool
-	Cause              error
-}
-
-func (r MirrorResult) Pending() bool  { return r.State == StorageSyncPending }
-func (r MirrorResult) Conflict() bool { return r.State == StorageSyncConflict }
+type SessionDiary = storagecontract.Diary
+type MirrorResult = storagecontract.Result
 
 // StoragePort mirrors a durable local Session Diary. Implementations must be
 // idempotent for diary.Key and must report remote divergence instead of
@@ -172,6 +133,13 @@ func (m *Mirror) Mirror(ctx context.Context, diary SessionDiary) MirrorResult {
 		r.EffectiveRemoteHash = r.LocalHash
 	}
 	return r
+}
+
+// Recover performs the same deterministic key lookup for the legacy generic
+// client seam. Concrete GitHub providers implement their own recovery-only
+// marker discovery.
+func (m *Mirror) Recover(ctx context.Context, diary SessionDiary) MirrorResult {
+	return m.Mirror(ctx, diary)
 }
 
 func (m *Mirror) Status(ctx context.Context, diary SessionDiary) MirrorResult {

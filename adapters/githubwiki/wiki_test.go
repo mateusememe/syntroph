@@ -35,7 +35,7 @@ func TestMirrorCreatesDeterministicPageAndIsIdempotent(t *testing.T) {
 		}
 	}
 	logBefore := strings.TrimSpace(git(t, "-C", clone, "rev-list", "--count", "HEAD"))
-	second := provider.Mirror(context.Background(), diary)
+	second := provider.Status(context.Background(), diary)
 	if second.State != storage.Mirrored || second.RemoteRev != first.RemoteRev {
 		t.Fatalf("idempotent mirror = %+v, first=%+v", second, first)
 	}
@@ -62,7 +62,11 @@ func TestManagedMirrorReconstructsBindingAndPersistsPrivateConflict(t *testing.T
 	if err := os.Remove(bindingPath); err != nil {
 		t.Fatal(err)
 	}
-	recovered := managed.Mirror(context.Background(), diary)
+	withoutRecovery := managed.Mirror(context.Background(), diary)
+	if withoutRecovery.State != storage.StorageSyncPending || !withoutRecovery.UnverifiedIdentity {
+		t.Fatalf("normal mirror reconstructed a missing Wiki binding: %+v", withoutRecovery)
+	}
+	recovered := managed.Recover(context.Background(), diary)
 	if recovered.State != storage.Mirrored {
 		t.Fatalf("lost-binding recovery = %+v", recovered)
 	}
@@ -71,7 +75,7 @@ func TestManagedMirrorReconstructsBindingAndPersistsPrivateConflict(t *testing.T
 	}
 
 	editWikiPage(t, remote, recovered.RemoteID, "# Human edit\n")
-	conflict := managed.Mirror(context.Background(), diary)
+	conflict := managed.Recover(context.Background(), diary)
 	if conflict.State != storage.StorageSyncConflict || !errors.Is(conflict.Cause, storage.ErrConflict) || conflict.ConflictSnapshot == "" {
 		t.Fatalf("conflict = %+v", conflict)
 	}
@@ -106,7 +110,7 @@ func TestLostBindingIsNotReconstructedWithoutExactFrontmatterMarker(t *testing.T
 	}
 	editWikiPage(t, remote, created.RemoteID, "# Page without Syntroph marker\n")
 
-	conflict := managed.Mirror(context.Background(), diary)
+	conflict := managed.Recover(context.Background(), diary)
 	if conflict.State != storage.StorageSyncConflict || !conflict.UnverifiedIdentity || conflict.ConflictSnapshot == "" {
 		t.Fatalf("unverified deterministic path = %+v", conflict)
 	}
@@ -121,7 +125,7 @@ func TestResolveKeepLocalCreatesAuditableCommit(t *testing.T) {
 	diary := testDiary()
 	created := provider.Mirror(context.Background(), diary)
 	editWikiPage(t, remote, created.RemoteID, "# Human edit\n")
-	conflict := provider.Mirror(context.Background(), diary)
+	conflict := provider.Status(context.Background(), diary)
 	resolved := provider.Resolve(context.Background(), diary, storage.KeepLocal, conflict.RemoteRev)
 	if resolved.State != storage.Mirrored || resolved.RemoteRev == conflict.RemoteRev {
 		t.Fatalf("keep local = %+v", resolved)
@@ -220,7 +224,8 @@ func TestMissingWikiAndMissingAuthorArePrerequisites(t *testing.T) {
 	})
 	t.Run("credentials are unavailable", func(t *testing.T) {
 		gitExecutable := filepath.Join(t.TempDir(), "git-denied")
-		script := "#!/bin/sh\necho 'git@github.com: Permission denied (publickey).' >&2\nexit 128\n"
+		secret := "git-secret"
+		script := "#!/bin/sh\necho 'https://alice:" + secret + "@github.com/acme/repo.wiki.git: Permission denied " + strings.Repeat("diagnostic", 400) + "' >&2\nexit 128\n"
 		if err := os.WriteFile(gitExecutable, []byte(script), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -232,10 +237,21 @@ func TestMissingWikiAndMissingAuthorArePrerequisites(t *testing.T) {
 			t.Fatal(err)
 		}
 		result := p.Mirror(context.Background(), testDiary())
-		if result.State != storage.StoragePrerequisiteMissing || !errors.Is(result.Cause, storage.ErrPrerequisiteMissing) || !strings.Contains(result.Cause.Error(), "credential-helper or SSH") {
+		if result.State != storage.StoragePrerequisiteMissing || !errors.Is(result.Cause, storage.ErrPrerequisiteMissing) || !strings.Contains(result.Cause.Error(), "credential-helper or SSH") || strings.Contains(result.Cause.Error(), secret) || len(result.Cause.Error()) > 2200 {
 			t.Fatalf("missing credentials = %+v", result)
 		}
 	})
+}
+
+func TestWikiProviderRejectsCredentialBearingRemoteBeforeGit(t *testing.T) {
+	secret := "wiki-secret"
+	_, err := New(Options{
+		Repository: "acme/repo", RemoteURL: "https://alice:" + secret + "@github.com/acme/repo.wiki.git",
+		GitExecutable: "git", Author: Author{Name: "Syntroph", Email: "syntroph@example.test"},
+	})
+	if err == nil || strings.Contains(err.Error(), secret) {
+		t.Fatalf("credential-bearing Wiki remote was not rejected safely: %v", err)
+	}
 }
 
 func TestFallbackAuthorUsesRepositoryConfigWithoutMutation(t *testing.T) {

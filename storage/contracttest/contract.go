@@ -20,6 +20,7 @@ import (
 
 type Port interface {
 	Mirror(context.Context, storage.SessionDiary) storage.MirrorResult
+	Recover(context.Context, storage.SessionDiary) storage.MirrorResult
 	Status(context.Context, storage.SessionDiary) storage.MirrorResult
 	Resolve(context.Context, storage.SessionDiary, storage.Resolution, string) storage.MirrorResult
 }
@@ -72,7 +73,7 @@ func Run(t *testing.T, name string, factory Factory) {
 		if err := os.Remove(bindingPath); err != nil {
 			t.Fatal(err)
 		}
-		reconstructed := fixture.Port.Mirror(context.Background(), providerDiary)
+		reconstructed := fixture.Port.Recover(context.Background(), providerDiary)
 		if reconstructed.State != storage.Mirrored || fixture.CreateCount() != created {
 			t.Fatalf("lost binding reconstruction duplicated mirror: result=%+v creates=%d want=%d", reconstructed, fixture.CreateCount(), created)
 		}
@@ -123,7 +124,7 @@ func Run(t *testing.T, name string, factory Factory) {
 			if tc.state == storage.StorageSyncPending {
 				fault.clear()
 				result := (storageadapter.Adapter{Provider: fault}).MirrorEvent(context.Background(), diary.SessionID+":storage-retry", diary)
-				if result.State != string(storage.Mirrored) || result.Key != diary.IdempotencyKey || result.Provider != fixture.Provider {
+				if result.State != storage.Mirrored || result.Key != diary.IdempotencyKey || result.Provider != fixture.Provider {
 					t.Fatalf("explicit retry changed mirror identity: %+v", result)
 				}
 				assertBinding(t, fixture, diary.IdempotencyKey)
@@ -209,6 +210,13 @@ func (p *faultPort) Mirror(ctx context.Context, diary storage.SessionDiary) stor
 
 func (p *faultPort) Status(ctx context.Context, diary storage.SessionDiary) storage.MirrorResult {
 	return p.delegate.Status(ctx, diary)
+}
+
+func (p *faultPort) Recover(ctx context.Context, diary storage.SessionDiary) storage.MirrorResult {
+	if p.cause != nil {
+		return storage.MirrorResult{State: p.state, Backend: p.backend, Provider: p.provider, Key: diary.Key(), FailureClass: p.class, Cause: p.cause}
+	}
+	return p.delegate.Recover(ctx, diary)
 }
 
 func (p *faultPort) Resolve(ctx context.Context, diary storage.SessionDiary, choice storage.Resolution, observed string) storage.MirrorResult {

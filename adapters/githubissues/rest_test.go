@@ -126,8 +126,6 @@ func TestMirrorReconcilesReservedLabelsBeforeCreatingIssue(t *testing.T) {
 		t.Fatalf("mirror result = %+v", result)
 	}
 	wantOrder := []string{
-		"GET /repos/mateusememe/syntroph/issues",
-		"GET /repos/mateusememe/syntroph/issues",
 		"GET /repos/mateusememe/syntroph/labels/syntroph-memory",
 		"PATCH /repos/mateusememe/syntroph/labels/syntroph-memory",
 		"GET /repos/mateusememe/syntroph/labels/syntroph-session",
@@ -204,31 +202,37 @@ func TestEnsureLabelsRecoversFromConcurrentCreateRace(t *testing.T) {
 	}
 }
 
-func TestMirrorRecoversMarkedOpenIssueWithoutDuplicate(t *testing.T) {
+func TestRecoveryIgnoresMarkedOpenIssueAndNormalMirrorDoesNotScan(t *testing.T) {
 	d := testDiary()
 	creates := 0
 	closes := 0
+	labels := 0
+	scans := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Query().Get("state") == "closed":
+			scans++
 			fmt.Fprint(w, `[]`)
-		case r.Method == http.MethodGet && r.URL.Query().Get("state") == "open":
-			_ = json.NewEncoder(w).Encode([]issue{{Number: 8, HTMLURL: "https://github.test/issues/8", Body: diaryBody(d.Content, d.Key()), UpdatedAt: mustTime("2026-08-31T12:00:00Z"), State: "open"}})
-		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/issues/8"):
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/labels/"):
+			labels++
+			name, _ := url.PathUnescape(filepath.Base(r.URL.Path))
+			_ = json.NewEncoder(w).Encode(label{Name: name, Color: map[string]string{"syntroph-memory": "00e5ff", "syntroph-session": "a855f7"}[name], Description: map[string]string{"syntroph-memory": "Immutable Syntroph session memory.", "syntroph-session": "Syntroph session diary mirror."}[name]})
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/issues/9"):
 			closes++
-			_ = json.NewEncoder(w).Encode(issue{Number: 8, HTMLURL: "https://github.test/issues/8", Body: diaryBody(d.Content, d.Key()), UpdatedAt: mustTime("2026-08-31T12:01:00Z"), State: "closed", StateReason: "completed"})
+			_ = json.NewEncoder(w).Encode(issue{Number: 9, HTMLURL: "https://github.test/issues/9", Body: diaryBody(d.Content, d.Key()), UpdatedAt: mustTime("2026-08-31T12:01:00Z"), State: "closed", StateReason: "completed"})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/issues"):
 			creates++
-			w.WriteHeader(500)
+			_ = json.NewEncoder(w).Encode(issue{Number: 9, HTMLURL: "https://github.test/issues/9", Body: diaryBody(d.Content, d.Key()), UpdatedAt: mustTime("2026-08-31T12:00:00Z"), State: "open"})
 		default:
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL)
 		}
 	}))
 	defer server.Close()
-	r := newTestProvider(t, server).Mirror(context.Background(), d)
-	if r.State != storage.Mirrored || r.RemoteID != "8" || creates != 0 || closes != 1 {
-		t.Fatalf("result=%+v creates=%d closes=%d", r, creates, closes)
+	p := newTestProvider(t, server)
+	r := p.Mirror(context.Background(), d)
+	if r.State != storage.Mirrored || r.RemoteID != "9" || creates != 1 || closes != 1 || scans != 0 || labels != 2 {
+		t.Fatalf("normal result=%+v creates=%d closes=%d scans=%d", r, creates, closes, scans)
 	}
 }
 
@@ -241,7 +245,11 @@ func TestMirrorResumesAfterCreateWithoutDuplicatingTheIssue(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Query().Get("state") == "closed":
-			fmt.Fprint(w, `[]`)
+			if closeFailures == 3 {
+				_ = json.NewEncoder(w).Encode([]issue{{Number: 31, HTMLURL: "https://github.test/issues/31", Body: diaryBody(d.Content, d.Key()), UpdatedAt: mustTime("2026-08-31T12:01:00Z"), State: "closed", StateReason: "completed"}})
+			} else {
+				fmt.Fprint(w, `[]`)
+			}
 		case r.Method == http.MethodGet && r.URL.Query().Get("state") == "open":
 			if !created {
 				fmt.Fprint(w, `[]`)
@@ -280,7 +288,7 @@ func TestMirrorResumesAfterCreateWithoutDuplicatingTheIssue(t *testing.T) {
 	if first.State != storage.StorageSyncPending || issueCreates != 1 || closeFailures != 3 {
 		t.Fatalf("first=%+v creates=%d closeFailures=%d", first, issueCreates, closeFailures)
 	}
-	second := p.Mirror(context.Background(), d)
+	second := p.Recover(context.Background(), d)
 	if second.State != storage.Mirrored || second.RemoteID != "31" || issueCreates != 1 {
 		t.Fatalf("second=%+v creates=%d", second, issueCreates)
 	}
@@ -333,7 +341,7 @@ func TestMirrorRecoversClosedIssueWhenBindingWasNotPersisted(t *testing.T) {
 	if first.State != storage.StorageSyncPending || !closed {
 		t.Fatalf("first=%+v closed=%v", first, closed)
 	}
-	second := p.Mirror(context.Background(), d)
+	second := p.Recover(context.Background(), d)
 	if second.State != storage.Mirrored || issueCreates != 1 || closeCalls != 3 {
 		t.Fatalf("second=%+v creates=%d closes=%d", second, issueCreates, closeCalls)
 	}
@@ -460,7 +468,8 @@ func TestCorrectionRevisionCanBeResolvedAgain(t *testing.T) {
 func TestCorrectionReplayReusesExactVersionedCommentAfterBindingCrash(t *testing.T) {
 	d := testDiary()
 	remoteBody := "human edit"
-	existing := comment{ID: 91, HTMLURL: "https://github.test/issues/9#issuecomment-91", Body: correctionBody(d.Content, d.Key()), UpdatedAt: mustTime("2026-08-31T12:03:00Z")}
+	predecessor := "issue:9:2026-08-31T12:00:00Z:" + hash(remoteBody)
+	existing := comment{ID: 91, HTMLURL: "https://github.test/issues/9#issuecomment-91", Body: correctionBody(d.Content, d.Key(), predecessor), UpdatedAt: mustTime("2026-08-31T12:03:00Z")}
 	commentCreates := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -490,6 +499,45 @@ func TestCorrectionReplayReusesExactVersionedCommentAfterBindingCrash(t *testing
 	result := p.Resolve(context.Background(), d, storage.KeepLocal, string(binding.RemoteRevision))
 	if result.State != storage.Mirrored || result.RemoteRev != commentRevision(existing) || commentCreates != 0 {
 		t.Fatalf("result=%+v commentCreates=%d", result, commentCreates)
+	}
+}
+
+func TestCorrectionReplayRequiresTheObservedPredecessorRevision(t *testing.T) {
+	d := testDiary()
+	oldRemote, newerRemote := "first human edit", "newer human edit"
+	oldRevision := "issue:9:2026-08-31T12:00:00Z:" + hash(oldRemote)
+	newerIssue := issue{Number: 9, HTMLURL: "https://github.test/issues/9", Body: newerRemote, UpdatedAt: mustTime("2026-08-31T12:04:00Z"), State: "closed", StateReason: "completed"}
+	oldCorrection := comment{ID: 91, Body: correctionBody(d.Content, d.Key(), oldRevision), UpdatedAt: mustTime("2026-08-31T12:03:00Z")}
+	created := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/issues/9"):
+			_ = json.NewEncoder(w).Encode(newerIssue)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/issues/9/comments"):
+			_ = json.NewEncoder(w).Encode([]comment{oldCorrection})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/issues/9/comments"):
+			created++
+			var payload map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			marker, ok := parseCorrectionMarker(payload["body"], d.Key())
+			if !ok || marker.Predecessor != issueRevision(newerIssue) {
+				t.Fatalf("new correction predecessor = %+v ok=%v", marker, ok)
+			}
+			_ = json.NewEncoder(w).Encode(comment{ID: 92, Body: payload["body"], UpdatedAt: mustTime("2026-08-31T12:05:00Z")})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL)
+		}
+	}))
+	defer server.Close()
+	p := newTestProvider(t, server)
+	binding := storage.RemoteBinding{IdempotencyKey: d.Key(), Backend: storage.BackendIssues, Provider: ProviderID, RemoteID: "9", URL: newerIssue.HTMLURL, RemoteRevision: storage.RemoteRevision(oldRevision), LocalHash: hash(d.Content), EffectiveRemoteHash: hash(oldRemote), UpdatedAt: time.Now().UTC()}
+	if err := p.bindings.Save(context.Background(), binding); err != nil {
+		t.Fatal(err)
+	}
+	result := p.Resolve(context.Background(), d, storage.KeepLocal, issueRevision(newerIssue))
+	if result.State != storage.Mirrored || !strings.HasPrefix(result.RemoteRev, "comment:92:") || created != 1 {
+		t.Fatalf("old correction was reused after newer edit: result=%+v created=%d", result, created)
 	}
 }
 
@@ -706,7 +754,7 @@ func TestLostBindingRecoveryFollowsPaginationAndSkipsPullRequests(t *testing.T) 
 		_ = json.NewEncoder(w).Encode([]issue{{Number: 12, HTMLURL: "https://github.test/issues/12", Body: diaryBody(d.Content, d.Key()), UpdatedAt: mustTime("2026-08-31T12:00:00Z"), State: "closed", StateReason: "completed"}})
 	}))
 	defer server.Close()
-	r := newTestProvider(t, server).Mirror(context.Background(), d)
+	r := newTestProvider(t, server).Recover(context.Background(), d)
 	if r.State != storage.Mirrored || r.RemoteID != "12" || page != 2 {
 		t.Fatalf("page=%d result=%+v", page, r)
 	}
@@ -732,7 +780,7 @@ func TestConflictIsPersistedPrivatelyByManagedMirror(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := managed.Mirror(context.Background(), d)
+	r := managed.Recover(context.Background(), d)
 	if r.State != storage.StorageSyncConflict || r.ConflictSnapshot == "" {
 		t.Fatalf("result %+v", r)
 	}

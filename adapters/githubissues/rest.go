@@ -137,146 +137,31 @@ type comment struct {
 }
 
 func (p *Provider) Mirror(ctx context.Context, diary storage.SessionDiary) storage.MirrorResult {
+	return p.mirror(ctx, diary, false)
+}
+
+// Recover is the explicit retry path. Only this path may scan closed Issues
+// for the exact diary marker when the local binding is absent.
+func (p *Provider) Recover(ctx context.Context, diary storage.SessionDiary) storage.MirrorResult {
+	return p.mirror(ctx, diary, true)
+}
+
+func (p *Provider) mirror(ctx context.Context, diary storage.SessionDiary, recovery bool) storage.MirrorResult {
 	p.operations.Lock()
 	defer p.operations.Unlock()
-	r := p.baseResult(diary)
-	if err := diary.Validate(); err != nil {
-		return pending(r, err)
-	}
-	binding, ok, err := p.bindings.Load(ctx, r.Key)
-	if err != nil {
-		return pending(r, err)
-	}
-	var remote issue
-	if ok {
-		if strings.HasPrefix(string(binding.RemoteRevision), "comment:") {
-			return p.compareCorrection(ctx, r, diary.Content, binding)
-		}
-		remote, err = p.getIssue(ctx, binding.RemoteID)
-	} else {
-		remote, err = p.findMarked(ctx, r.Key)
-		if errors.Is(err, errNotFound) {
-			err = nil
-		}
-	}
-	if err != nil {
-		return p.failed(r, err)
-	}
-	if remote.Number != 0 {
-		return p.finishExisting(ctx, r, diary, remote)
-	}
-	if err := p.ensureLabels(ctx); err != nil {
-		return p.failed(r, err)
-	}
-	remote, err = p.createIssue(ctx, diary)
-	if err != nil {
-		return p.failed(r, err)
-	}
-	// If the close response is lost, the exact marker lets an explicit retry
-	// reconstruct this same Issue instead of creating another one.
-	created := remote
-	remote, err = p.closeIssue(ctx, remote.Number)
-	if err != nil {
-		return p.failedWithRemote(r, created, err)
-	}
-	return mirroredIssue(r, remote, diary.Content)
+	return (issueSemantics{provider: ProviderID, bindings: p.bindings, ops: p}).mirror(ctx, diary, recovery)
 }
 
 func (p *Provider) Status(ctx context.Context, diary storage.SessionDiary) storage.MirrorResult {
 	p.operations.Lock()
 	defer p.operations.Unlock()
-	r := p.baseResult(diary)
-	binding, ok, err := p.bindings.Load(ctx, r.Key)
-	if err != nil {
-		return pending(r, err)
-	}
-	if !ok {
-		return pending(r, errors.New("remote binding not found; run explicit storage recovery"))
-	}
-	if strings.HasPrefix(string(binding.RemoteRevision), "comment:") {
-		return p.compareCorrection(ctx, r, diary.Content, binding)
-	}
-	remote, err := p.getIssue(ctx, binding.RemoteID)
-	if err != nil {
-		return p.failed(r, err)
-	}
-	return p.compare(r, diary.Content, remote)
+	return (issueSemantics{provider: ProviderID, bindings: p.bindings, ops: p}).status(ctx, diary)
 }
 
 func (p *Provider) Resolve(ctx context.Context, diary storage.SessionDiary, choice storage.Resolution, observedRevision string) storage.MirrorResult {
 	p.operations.Lock()
 	defer p.operations.Unlock()
-	r := p.baseResult(diary)
-	if choice != storage.KeepLocal && choice != storage.KeepRemote {
-		return conflict(r, issue{}, errors.New("resolution must be keep-local or keep-remote"))
-	}
-	binding, ok, err := p.bindings.Load(ctx, r.Key)
-	if err != nil {
-		return pending(r, err)
-	}
-	if !ok {
-		return pending(r, errors.New("remote binding not found"))
-	}
-	effective, err := p.effectiveRemote(ctx, binding)
-	if err != nil {
-		return p.failed(r, err)
-	}
-	currentRev := effective.revision
-	r.RemoteID, r.RemoteURL, r.RemoteRev, r.ExpectedRev = binding.RemoteID, binding.URL, currentRev, observedRevision
-	r.RemoteContent, r.EffectiveRemoteHash = effective.content, hash(effective.content)
-	if observedRevision == "" || observedRevision != currentRev {
-		r.State, r.FailureClass, r.Cause = storage.StorageSyncConflict, storage.FailureConflict, storage.ErrConflict
-		return r
-	}
-	if choice == storage.KeepRemote {
-		r.State = storage.Mirrored
-		return r
-	}
-	number, err := strconv.Atoi(binding.RemoteID)
-	if err != nil || number <= 0 {
-		return pending(r, errors.New("remote binding contains an invalid Issue number"))
-	}
-	c, err := p.findCorrection(ctx, number, diary)
-	if errors.Is(err, errNotFound) {
-		c, err = p.createCorrection(ctx, number, diary)
-	}
-	if err != nil {
-		return p.failed(r, err)
-	}
-	r.State, r.RemoteRev, r.EffectiveRemoteHash = storage.Mirrored, commentRevision(c), hash(diary.Content)
-	// Preserve the Issue as the Remote Mirror identity; the revision identifies
-	// the append-only correction that is now effective.
-	r.RemoteID, r.RemoteURL = binding.RemoteID, binding.URL
-	return r
-}
-
-func (p *Provider) finishExisting(ctx context.Context, r storage.MirrorResult, diary storage.SessionDiary, remote issue) storage.MirrorResult {
-	compared := p.compare(r, diary.Content, remote)
-	if compared.State != storage.Mirrored {
-		return compared
-	}
-	if remote.State != "closed" || remote.StateReason != "completed" {
-		closed, err := p.closeIssue(ctx, remote.Number)
-		if err != nil {
-			return p.failedWithRemote(r, remote, err)
-		}
-		return mirroredIssue(r, closed, diary.Content)
-	}
-	return compared
-}
-
-func (p *Provider) compare(r storage.MirrorResult, local string, remote issue) storage.MirrorResult {
-	remoteContent, exact := stripDiaryMarker(remote.Body, r.Key)
-	r.RemoteID, r.RemoteURL, r.RemoteRev = strconv.Itoa(remote.Number), remote.HTMLURL, issueRevision(remote)
-	r.RemoteContent, r.EffectiveRemoteHash = remote.Body, hash(remote.Body)
-	if exact {
-		r.RemoteContent, r.EffectiveRemoteHash = remoteContent, hash(remoteContent)
-	}
-	if exact && remoteContent == local {
-		r.State, r.EffectiveRemoteHash, r.RemoteContent = storage.Mirrored, hash(local), ""
-		return r
-	}
-	return conflict(r, remote, storage.ErrConflict)
+	return (issueSemantics{provider: ProviderID, bindings: p.bindings, ops: p}).resolve(ctx, diary, choice, observedRevision)
 }
 
 type effectiveRemote struct {
@@ -299,6 +184,19 @@ func (p *Provider) effectiveRemote(ctx context.Context, binding storage.RemoteBi
 		content, exact := stripCorrectionMarker(correction.Body, binding.IdempotencyKey)
 		if !exact {
 			content = correction.Body
+			return effectiveRemote{revision: commentRevision(correction), content: content, exact: false}, nil
+		}
+		marker, _ := parseCorrectionMarker(correction.Body, binding.IdempotencyKey)
+		remote, issueErr := p.getIssue(ctx, binding.RemoteID)
+		if issueErr != nil {
+			return effectiveRemote{}, issueErr
+		}
+		if revisionBodyHash(marker.Predecessor) != hash(remote.Body) {
+			remoteContent, markerExact := stripDiaryMarker(remote.Body, binding.IdempotencyKey)
+			if !markerExact {
+				remoteContent = remote.Body
+			}
+			return effectiveRemote{revision: issueRevision(remote), content: remoteContent, exact: markerExact}, nil
 		}
 		return effectiveRemote{revision: commentRevision(correction), content: content, exact: exact}, nil
 	}
@@ -313,21 +211,6 @@ func (p *Provider) effectiveRemote(ctx context.Context, binding storage.RemoteBi
 	return effectiveRemote{revision: issueRevision(remote), content: content, exact: exact}, nil
 }
 
-func (p *Provider) compareCorrection(ctx context.Context, r storage.MirrorResult, local string, binding storage.RemoteBinding) storage.MirrorResult {
-	effective, err := p.effectiveRemote(ctx, binding)
-	if err != nil {
-		return p.failed(r, err)
-	}
-	r.RemoteID, r.RemoteURL, r.RemoteRev = binding.RemoteID, binding.URL, effective.revision
-	r.RemoteContent, r.EffectiveRemoteHash = effective.content, hash(effective.content)
-	if effective.exact && effective.content == local {
-		r.State, r.RemoteContent = storage.Mirrored, ""
-		return r
-	}
-	r.State, r.FailureClass, r.Cause = storage.StorageSyncConflict, storage.FailureConflict, storage.ErrConflict
-	return r
-}
-
 func revisionID(revision, kind string) (string, error) {
 	prefix := kind + ":"
 	if !strings.HasPrefix(revision, prefix) {
@@ -340,26 +223,12 @@ func revisionID(revision, kind string) (string, error) {
 	return id, nil
 }
 
-func (p *Provider) baseResult(d storage.SessionDiary) storage.MirrorResult {
-	return storage.MirrorResult{Backend: storage.BackendIssues, Provider: ProviderID, Key: d.Key(), LocalHash: hash(d.Content)}
-}
-
 func mirroredIssue(r storage.MirrorResult, i issue, content string) storage.MirrorResult {
 	r.State, r.RemoteID, r.RemoteURL, r.RemoteRev = storage.Mirrored, strconv.Itoa(i.Number), i.HTMLURL, issueRevision(i)
 	r.EffectiveRemoteHash = hash(content)
 	return r
 }
 
-func conflict(r storage.MirrorResult, i issue, err error) storage.MirrorResult {
-	r.State, r.FailureClass, r.Cause = storage.StorageSyncConflict, storage.FailureConflict, err
-	if i.Number != 0 {
-		r.RemoteID, r.RemoteURL, r.RemoteRev, r.RemoteContent, r.EffectiveRemoteHash = strconv.Itoa(i.Number), i.HTMLURL, issueRevision(i), i.Body, hash(i.Body)
-		if content, exact := stripDiaryMarker(i.Body, r.Key); exact {
-			r.RemoteContent, r.EffectiveRemoteHash = content, hash(content)
-		}
-	}
-	return r
-}
 func pending(r storage.MirrorResult, err error) storage.MirrorResult {
 	r.State, r.FailureClass, r.Cause = storage.StorageSyncPending, storage.FailureTransient, err
 	return r
@@ -457,9 +326,9 @@ func (p *Provider) closeIssue(ctx context.Context, number int) (issue, error) {
 	_, _, err := p.request(ctx, http.MethodPatch, p.repoPath("issues/"+strconv.Itoa(number)), map[string]string{"state": "closed", "state_reason": "completed"}, &out)
 	return out, err
 }
-func (p *Provider) createCorrection(ctx context.Context, number int, d storage.SessionDiary) (comment, error) {
+func (p *Provider) createCorrection(ctx context.Context, number int, d storage.SessionDiary, predecessor string) (comment, error) {
 	var out comment
-	body := correctionBody(d.Content, d.Key())
+	body := correctionBody(d.Content, d.Key(), predecessor)
 	_, _, err := p.request(ctx, http.MethodPost, p.repoPath("issues/"+strconv.Itoa(number)+"/comments"), map[string]string{"body": body}, &out)
 	return out, err
 }
@@ -483,7 +352,7 @@ func (p *Provider) getComment(ctx context.Context, id string) (comment, error) {
 // findCorrection makes keep-local safe to redeliver after a crash between the
 // comment write and the atomic binding update. The marker version is the hash
 // of the canonical local diary, so only the exact correction is reused.
-func (p *Provider) findCorrection(ctx context.Context, number int, d storage.SessionDiary) (comment, error) {
+func (p *Provider) findCorrection(ctx context.Context, number int, d storage.SessionDiary, predecessor string) (comment, error) {
 	p.scan.Lock()
 	defer p.scan.Unlock()
 	next := p.repoPath("issues/"+strconv.Itoa(number)+"/comments") + "?per_page=100"
@@ -496,7 +365,8 @@ func (p *Provider) findCorrection(ctx context.Context, number int, d storage.Ses
 		}
 		for _, candidate := range comments {
 			content, exact := stripCorrectionMarker(candidate.Body, d.Key())
-			if exact && content == d.Content {
+			marker, markerOK := parseCorrectionMarker(candidate.Body, d.Key())
+			if exact && markerOK && marker.Predecessor == predecessor && content == d.Content {
 				return candidate, nil
 			}
 		}
@@ -508,25 +378,26 @@ func (p *Provider) findCorrection(ctx context.Context, number int, d storage.Ses
 func (p *Provider) findMarked(ctx context.Context, key string) (issue, error) {
 	p.scan.Lock()
 	defer p.scan.Unlock()
-	for _, state := range []string{"closed", "open"} {
-		next := p.repoPath("issues") + "?state=" + state + "&labels=syntroph-memory%2Csyntroph-session&per_page=100"
-		for next != "" {
-			var issues []issue
-			p.lastNext = ""
-			_, _, err := p.request(ctx, http.MethodGet, next, nil, &issues)
-			if err != nil {
-				return issue{}, err
-			}
-			for _, candidate := range issues {
-				if len(candidate.PullRequest) != 0 && string(candidate.PullRequest) != "null" {
-					continue
-				}
-				if hasDiaryMarker(candidate.Body, key) {
-					return candidate, nil
-				}
-			}
-			next = p.lastNext
+	next := p.repoPath("issues") + "?state=closed&labels=syntroph-memory%2Csyntroph-session&per_page=100"
+	for next != "" {
+		var issues []issue
+		p.lastNext = ""
+		_, _, err := p.request(ctx, http.MethodGet, next, nil, &issues)
+		if err != nil {
+			return issue{}, err
 		}
+		for _, candidate := range issues {
+			if candidate.State != "closed" {
+				continue
+			}
+			if len(candidate.PullRequest) != 0 && string(candidate.PullRequest) != "null" {
+				continue
+			}
+			if hasDiaryMarker(candidate.Body, key) {
+				return candidate, nil
+			}
+		}
+		next = p.lastNext
 	}
 	return issue{}, errNotFound
 }
@@ -680,21 +551,40 @@ func stripDiaryMarker(body, key string) (string, bool) {
 	}
 	return strings.TrimSuffix(body, marker), true
 }
-func correctionBody(content, key string) string {
-	return content + "\n\n<!-- syntroph-remote-correction:key=" + key + ";version=" + hash(content) + " -->\n"
+func correctionBody(content, key, predecessor string) string {
+	return content + "\n\n<!-- syntroph-remote-correction:key=" + key + ";local=" + hash(content) + ";predecessor=" + predecessor + " -->\n"
 }
 func stripCorrectionMarker(body, key string) (string, bool) {
-	suffixStart := "\n\n<!-- syntroph-remote-correction:key=" + key + ";version="
-	i := strings.LastIndex(body, suffixStart)
+	marker, ok := parseCorrectionMarker(body, key)
+	return marker.Content, ok
+}
+
+type correctionMarker struct {
+	Content     string
+	LocalHash   string
+	Predecessor string
+}
+
+func parseCorrectionMarker(body, key string) (correctionMarker, bool) {
+	prefix := "\n\n<!-- syntroph-remote-correction:key=" + key + ";local="
+	i := strings.LastIndex(body, prefix)
 	if i < 0 || !strings.HasSuffix(body, " -->\n") {
-		return "", false
+		return correctionMarker{}, false
 	}
-	version := strings.TrimSuffix(body[i+len(suffixStart):], " -->\n")
+	metadata := strings.TrimSuffix(body[i+len(prefix):], " -->\n")
+	localHash, predecessor, ok := strings.Cut(metadata, ";predecessor=")
 	content := body[:i]
-	if version != hash(content) {
-		return "", false
+	if !ok || predecessor == "" || localHash != hash(content) {
+		return correctionMarker{}, false
 	}
-	return content, true
+	return correctionMarker{Content: content, LocalHash: localHash, Predecessor: predecessor}, true
+}
+
+func revisionBodyHash(revision string) string {
+	if i := strings.LastIndexByte(revision, ':'); i >= 0 {
+		return revision[i+1:]
+	}
+	return ""
 }
 func hash(content string) string {
 	sum := sha256.Sum256([]byte(content))

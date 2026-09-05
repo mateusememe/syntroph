@@ -210,6 +210,10 @@ func (p failedStorageProvider) Resolve(_ context.Context, diary storage.SessionD
 	return p.Mirror(context.Background(), diary)
 }
 
+func (p failedStorageProvider) Recover(_ context.Context, diary storage.SessionDiary) storage.MirrorResult {
+	return p.Mirror(context.Background(), diary)
+}
+
 func staticCheck(report core.StoragePreflightResult) func(context.Context) core.StoragePreflightResult {
 	return func(context.Context) core.StoragePreflightResult { return report }
 }

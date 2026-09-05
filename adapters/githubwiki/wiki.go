@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mateusememe/syntroph/core/storagecontract"
 	"github.com/mateusememe/syntroph/storage"
 )
 
@@ -89,6 +91,14 @@ func (p *ManagedProvider) Resolve(ctx context.Context, diary storage.SessionDiar
 	return p.managed.Resolve(ctx, diary, choice, observed)
 }
 
+func (p *ManagedProvider) Recover(ctx context.Context, diary storage.SessionDiary) storage.MirrorResult {
+	p.initialize()
+	if p.err != nil {
+		return p.remote.failure(diary, storage.StorageSyncPending, storage.FailureTransient, p.err)
+	}
+	return p.managed.Recover(ctx, diary)
+}
+
 func New(options Options) (*Provider, error) {
 	options.Repository = strings.TrimSpace(options.Repository)
 	options.RemoteURL = strings.TrimSpace(options.RemoteURL)
@@ -100,6 +110,12 @@ func New(options Options) (*Provider, error) {
 	if options.Repository == "" || options.RemoteURL == "" {
 		return nil, errors.New("GitHub Wiki provider requires repository and remote URL")
 	}
+	if parsed, err := url.Parse(options.RemoteURL); err == nil && parsed.User != nil {
+		_, hasPassword := parsed.User.Password()
+		if hasPassword || !strings.EqualFold(parsed.Scheme, "ssh") || parsed.User.Username() != "git" {
+			return nil, errors.New("GitHub Wiki remote URL must not contain userinfo or embedded credentials")
+		}
+	}
 	if options.WebURL == "" {
 		options.WebURL = "https://github.com/" + options.Repository + "/wiki"
 	}
@@ -110,7 +126,23 @@ func New(options Options) (*Provider, error) {
 }
 
 func (p *Provider) Mirror(ctx context.Context, diary storage.SessionDiary) storage.MirrorResult {
+	return p.apply(ctx, diary, "create", "")
+}
+
+// Create is used by ManagedMirror when no binding exists. It refuses to
+// reconstruct an existing deterministic page; explicit Recover owns that.
+func (p *Provider) Create(ctx context.Context, diary storage.SessionDiary) storage.MirrorResult {
+	return p.apply(ctx, diary, "create", "")
+}
+
+// MirrorBound is selected by ManagedMirror only after the local binding has
+// been loaded, so inspecting the deterministic path cannot reconstruct state.
+func (p *Provider) MirrorBound(ctx context.Context, diary storage.SessionDiary) storage.MirrorResult {
 	return p.apply(ctx, diary, "", "")
+}
+
+func (p *Provider) Recover(ctx context.Context, diary storage.SessionDiary) storage.MirrorResult {
+	return p.apply(ctx, diary, "recover", "")
 }
 
 func (p *Provider) Status(ctx context.Context, diary storage.SessionDiary) storage.MirrorResult {
@@ -184,9 +216,13 @@ func (p *Provider) apply(ctx context.Context, diary storage.SessionDiary, mode s
 	if readErr == nil {
 		base.RemoteContent = string(remote)
 		base.EffectiveRemoteHash = hash(string(remote))
-		if !hasExactFrontmatterMarker(string(remote), diary.Key()) && (mode == "" || mode == "status") {
+		if !hasExactFrontmatterMarker(string(remote), diary.Key()) && (mode == "" || mode == "status" || mode == "recover") {
 			base.UnverifiedIdentity = true
 			return p.fail(base, storage.StorageSyncConflict, storage.FailureConflict, fmt.Errorf("%w: deterministic Wiki path does not carry the expected Syntroph marker", storage.ErrConflict))
+		}
+		if mode == "create" {
+			base.UnverifiedIdentity = true
+			return p.fail(base, storage.StorageSyncPending, storage.FailureTransient, errors.New("Wiki page already exists without a local binding; run explicit storage recovery"))
 		}
 	}
 	if observed != "" && observed != base.RemoteRev {
@@ -278,7 +314,16 @@ type gitError struct {
 }
 
 func (e *gitError) Error() string {
-	return fmt.Sprintf("git %s: %v: %s", strings.Join(e.args, " "), e.cause, strings.TrimSpace(e.output))
+	args := append([]string(nil), e.args...)
+	for i, arg := range args {
+		if strings.Contains(arg, "://") {
+			if parsed, err := url.Parse(arg); err == nil && parsed.User != nil {
+				parsed.User = nil
+				args[i] = parsed.String()
+			}
+		}
+	}
+	return storagecontract.SafeDiagnostic(fmt.Sprintf("git %s: %v: %s", strings.Join(args, " "), e.cause, strings.TrimSpace(e.output)))
 }
 func (e *gitError) Unwrap() error { return e.cause }
 

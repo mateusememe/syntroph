@@ -20,7 +20,7 @@ var requiredMCPTools = map[string]toolRequirement{
 	"issue_read":        {Properties: []string{"owner", "repo", "method", "issue_number"}, Methods: []string{"get", "get_comments"}},
 	"issue_write":       {Properties: []string{"owner", "repo", "method", "title", "body", "labels", "issue_number", "state", "state_reason"}, Methods: []string{"create", "update"}},
 	"add_issue_comment": {Properties: []string{"owner", "repo", "issue_number", "body"}},
-	"list_issues":       {Properties: []string{"owner", "repo", "state", "labels", "cursor"}},
+	"list_issues":       {Properties: []string{"owner", "repo", "state", "labels", "after"}},
 }
 
 type toolRequirement struct {
@@ -43,6 +43,42 @@ type MCPProvider struct {
 	commandRun bool
 }
 
+type mcpIssueOperations struct {
+	provider *MCPProvider
+	client   *mcpClient
+}
+
+func (o mcpIssueOperations) ensureLabels(ctx context.Context) error {
+	return o.provider.ensureLabels(ctx, o.client)
+}
+func (o mcpIssueOperations) createIssue(ctx context.Context, d storage.SessionDiary) (issue, error) {
+	return o.provider.createIssue(ctx, o.client, d)
+}
+func (o mcpIssueOperations) closeIssue(ctx context.Context, number int) (issue, error) {
+	return o.provider.closeIssue(ctx, o.client, number)
+}
+func (o mcpIssueOperations) getIssue(ctx context.Context, id string) (issue, error) {
+	return o.provider.getIssue(ctx, o.client, id)
+}
+func (o mcpIssueOperations) effectiveRemote(ctx context.Context, b storage.RemoteBinding) (effectiveRemote, error) {
+	return o.provider.effectiveRemote(ctx, o.client, b)
+}
+func (o mcpIssueOperations) findCorrection(ctx context.Context, number int, d storage.SessionDiary, predecessor string) (comment, error) {
+	return o.provider.findCorrection(ctx, o.client, number, d, predecessor)
+}
+func (o mcpIssueOperations) createCorrection(ctx context.Context, number int, d storage.SessionDiary, predecessor string) (comment, error) {
+	return o.provider.createCorrection(ctx, o.client, number, d, predecessor)
+}
+func (o mcpIssueOperations) findMarked(ctx context.Context, key string) (issue, error) {
+	return o.provider.findMarked(ctx, o.client, key)
+}
+func (o mcpIssueOperations) failed(r storage.MirrorResult, err error) storage.MirrorResult {
+	return o.provider.failed(r, err)
+}
+func (o mcpIssueOperations) failedWithRemote(r storage.MirrorResult, remote issue, err error) storage.MirrorResult {
+	return o.provider.failedWithRemote(r, remote, err)
+}
+
 func NewMCP(repository string, command []string, storageRoot string, opts MCPOptions) (*MCPProvider, error) {
 	parts := strings.Split(repository, "/")
 	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
@@ -59,6 +95,14 @@ func NewMCP(repository string, command []string, storageRoot string, opts MCPOpt
 }
 
 func (p *MCPProvider) Mirror(ctx context.Context, diary storage.SessionDiary) storage.MirrorResult {
+	return p.mirror(ctx, diary, false)
+}
+
+func (p *MCPProvider) Recover(ctx context.Context, diary storage.SessionDiary) storage.MirrorResult {
+	return p.mirror(ctx, diary, true)
+}
+
+func (p *MCPProvider) mirror(ctx context.Context, diary storage.SessionDiary, recovery bool) storage.MirrorResult {
 	p.operations.Lock()
 	defer p.operations.Unlock()
 	r := p.baseResult(diary)
@@ -66,41 +110,8 @@ func (p *MCPProvider) Mirror(ctx context.Context, diary storage.SessionDiary) st
 		return pending(r, err)
 	}
 	return p.run(ctx, r, func(client *mcpClient) storage.MirrorResult {
-		binding, ok, err := p.bindings.Load(ctx, r.Key)
-		if err != nil {
-			return pending(r, err)
-		}
-		var remote issue
-		if ok {
-			if strings.HasPrefix(string(binding.RemoteRevision), "comment:") {
-				return p.compareCorrection(ctx, client, r, diary.Content, binding)
-			}
-			remote, err = p.getIssue(ctx, client, binding.RemoteID)
-		} else {
-			remote, err = p.findMarked(ctx, client, r.Key)
-			if errors.Is(err, errNotFound) {
-				err = nil
-			}
-		}
-		if err != nil {
-			return p.failed(r, err)
-		}
-		if remote.Number != 0 {
-			return p.finishExisting(ctx, client, r, diary, remote)
-		}
-		if err := p.ensureLabels(ctx, client); err != nil {
-			return p.failed(r, err)
-		}
-		remote, err = p.createIssue(ctx, client, diary)
-		if err != nil {
-			return p.failed(r, err)
-		}
-		created := remote
-		remote, err = p.closeIssue(ctx, client, remote.Number)
-		if err != nil {
-			return p.failedWithRemote(r, created, err)
-		}
-		return mirroredIssue(r, remote, diary.Content)
+		ops := mcpIssueOperations{provider: p, client: client}
+		return (issueSemantics{provider: MCPProviderID, bindings: p.bindings, ops: ops}).mirror(ctx, diary, recovery)
 	})
 }
 
@@ -109,21 +120,8 @@ func (p *MCPProvider) Status(ctx context.Context, diary storage.SessionDiary) st
 	defer p.operations.Unlock()
 	r := p.baseResult(diary)
 	return p.run(ctx, r, func(client *mcpClient) storage.MirrorResult {
-		binding, ok, err := p.bindings.Load(ctx, r.Key)
-		if err != nil {
-			return pending(r, err)
-		}
-		if !ok {
-			return pending(r, errors.New("remote binding not found; run explicit storage recovery"))
-		}
-		if strings.HasPrefix(string(binding.RemoteRevision), "comment:") {
-			return p.compareCorrection(ctx, client, r, diary.Content, binding)
-		}
-		remote, err := p.getIssue(ctx, client, binding.RemoteID)
-		if err != nil {
-			return p.failed(r, err)
-		}
-		return p.compare(r, diary.Content, remote)
+		ops := mcpIssueOperations{provider: p, client: client}
+		return (issueSemantics{provider: MCPProviderID, bindings: p.bindings, ops: ops}).status(ctx, diary)
 	})
 }
 
@@ -131,45 +129,9 @@ func (p *MCPProvider) Resolve(ctx context.Context, diary storage.SessionDiary, c
 	p.operations.Lock()
 	defer p.operations.Unlock()
 	r := p.baseResult(diary)
-	if choice != storage.KeepLocal && choice != storage.KeepRemote {
-		return mcpConflict(r, issue{}, errors.New("resolution must be keep-local or keep-remote"))
-	}
 	return p.run(ctx, r, func(client *mcpClient) storage.MirrorResult {
-		binding, ok, err := p.bindings.Load(ctx, r.Key)
-		if err != nil {
-			return pending(r, err)
-		}
-		if !ok {
-			return pending(r, errors.New("remote binding not found"))
-		}
-		effective, err := p.effectiveRemote(ctx, client, binding)
-		if err != nil {
-			return p.failed(r, err)
-		}
-		r.RemoteID, r.RemoteURL, r.RemoteRev, r.ExpectedRev = binding.RemoteID, binding.URL, effective.revision, observedRevision
-		r.RemoteContent, r.EffectiveRemoteHash = effective.content, hash(effective.content)
-		if observedRevision == "" || observedRevision != effective.revision {
-			r.State, r.FailureClass, r.Cause = storage.StorageSyncConflict, storage.FailureConflict, storage.ErrConflict
-			return r
-		}
-		if choice == storage.KeepRemote {
-			r.State = storage.Mirrored
-			return r
-		}
-		number, err := strconv.Atoi(binding.RemoteID)
-		if err != nil || number <= 0 {
-			return pending(r, errors.New("remote binding contains an invalid Issue number"))
-		}
-		correction, err := p.findCorrection(ctx, client, number, diary)
-		if errors.Is(err, errNotFound) {
-			correction, err = p.createCorrection(ctx, client, number, diary)
-		}
-		if err != nil {
-			return p.failed(r, err)
-		}
-		r.State, r.RemoteRev, r.EffectiveRemoteHash = storage.Mirrored, commentRevision(correction), hash(diary.Content)
-		r.RemoteID, r.RemoteURL = binding.RemoteID, binding.URL
-		return r
+		ops := mcpIssueOperations{provider: p, client: client}
+		return (issueSemantics{provider: MCPProviderID, bindings: p.bindings, ops: ops}).resolve(ctx, diary, choice, observedRevision)
 	})
 }
 
@@ -255,50 +217,6 @@ func (p *MCPProvider) baseResult(d storage.SessionDiary) storage.MirrorResult {
 	return storage.MirrorResult{Backend: storage.BackendIssues, Provider: MCPProviderID, Key: d.Key(), LocalHash: hash(d.Content)}
 }
 
-func (p *MCPProvider) finishExisting(ctx context.Context, client *mcpClient, r storage.MirrorResult, diary storage.SessionDiary, remote issue) storage.MirrorResult {
-	compared := p.compare(r, diary.Content, remote)
-	if compared.State != storage.Mirrored {
-		return compared
-	}
-	if remote.State != "closed" || remote.StateReason != "completed" {
-		closed, err := p.closeIssue(ctx, client, remote.Number)
-		if err != nil {
-			return p.failedWithRemote(r, remote, err)
-		}
-		return mirroredIssue(r, closed, diary.Content)
-	}
-	return compared
-}
-
-func (p *MCPProvider) compare(r storage.MirrorResult, local string, remote issue) storage.MirrorResult {
-	remoteContent, exact := stripDiaryMarker(remote.Body, r.Key)
-	r.RemoteID, r.RemoteURL, r.RemoteRev = strconv.Itoa(remote.Number), remote.HTMLURL, issueRevision(remote)
-	r.RemoteContent, r.EffectiveRemoteHash = remote.Body, hash(remote.Body)
-	if exact {
-		r.RemoteContent, r.EffectiveRemoteHash = remoteContent, hash(remoteContent)
-	}
-	if exact && remoteContent == local {
-		r.State, r.EffectiveRemoteHash, r.RemoteContent = storage.Mirrored, hash(local), ""
-		return r
-	}
-	return mcpConflict(r, remote, storage.ErrConflict)
-}
-
-func (p *MCPProvider) compareCorrection(ctx context.Context, client *mcpClient, r storage.MirrorResult, local string, binding storage.RemoteBinding) storage.MirrorResult {
-	effective, err := p.effectiveRemote(ctx, client, binding)
-	if err != nil {
-		return p.failed(r, err)
-	}
-	r.RemoteID, r.RemoteURL, r.RemoteRev = binding.RemoteID, binding.URL, effective.revision
-	r.RemoteContent, r.EffectiveRemoteHash = effective.content, hash(effective.content)
-	if effective.exact && effective.content == local {
-		r.State, r.RemoteContent = storage.Mirrored, ""
-		return r
-	}
-	r.State, r.FailureClass, r.Cause = storage.StorageSyncConflict, storage.FailureConflict, storage.ErrConflict
-	return r
-}
-
 func (p *MCPProvider) effectiveRemote(ctx context.Context, client *mcpClient, binding storage.RemoteBinding) (effectiveRemote, error) {
 	revision := string(binding.RemoteRevision)
 	if strings.HasPrefix(revision, "comment:") {
@@ -321,6 +239,19 @@ func (p *MCPProvider) effectiveRemote(ctx context.Context, client *mcpClient, bi
 			content, exact := stripCorrectionMarker(correction.Body, binding.IdempotencyKey)
 			if !exact {
 				content = correction.Body
+				return effectiveRemote{revision: commentRevision(correction), content: content, exact: false}, nil
+			}
+			marker, _ := parseCorrectionMarker(correction.Body, binding.IdempotencyKey)
+			remote, issueErr := p.getIssue(ctx, client, binding.RemoteID)
+			if issueErr != nil {
+				return effectiveRemote{}, issueErr
+			}
+			if revisionBodyHash(marker.Predecessor) != hash(remote.Body) {
+				remoteContent, markerExact := stripDiaryMarker(remote.Body, binding.IdempotencyKey)
+				if !markerExact {
+					remoteContent = remote.Body
+				}
+				return effectiveRemote{revision: issueRevision(remote), content: remoteContent, exact: markerExact}, nil
 			}
 			return effectiveRemote{revision: commentRevision(correction), content: content, exact: exact}, nil
 		}
@@ -390,20 +321,21 @@ func (p *MCPProvider) getIssue(ctx context.Context, client *mcpClient, id string
 	return out, err
 }
 
-func (p *MCPProvider) createCorrection(ctx context.Context, client *mcpClient, number int, diary storage.SessionDiary) (comment, error) {
+func (p *MCPProvider) createCorrection(ctx context.Context, client *mcpClient, number int, diary storage.SessionDiary, predecessor string) (comment, error) {
 	var out comment
-	err := client.CallTool(ctx, "add_issue_comment", p.args(map[string]any{"issue_number": number, "body": correctionBody(diary.Content, diary.Key())}), &out)
+	err := client.CallTool(ctx, "add_issue_comment", p.args(map[string]any{"issue_number": number, "body": correctionBody(diary.Content, diary.Key(), predecessor)}), &out)
 	return out, err
 }
 
-func (p *MCPProvider) findCorrection(ctx context.Context, client *mcpClient, number int, diary storage.SessionDiary) (comment, error) {
+func (p *MCPProvider) findCorrection(ctx context.Context, client *mcpClient, number int, diary storage.SessionDiary, predecessor string) (comment, error) {
 	comments, err := p.listComments(ctx, client, number)
 	if err != nil {
 		return comment{}, err
 	}
 	for _, candidate := range comments {
 		content, exact := stripCorrectionMarker(candidate.Body, diary.Key())
-		if exact && content == diary.Content {
+		marker, markerOK := parseCorrectionMarker(candidate.Body, diary.Key())
+		if exact && markerOK && marker.Predecessor == predecessor && content == diary.Content {
 			return candidate, nil
 		}
 	}
@@ -427,29 +359,30 @@ func (p *MCPProvider) listComments(ctx context.Context, client *mcpClient, numbe
 }
 
 func (p *MCPProvider) findMarked(ctx context.Context, client *mcpClient, key string) (issue, error) {
-	for _, state := range []string{"closed", "open"} {
-		cursor := ""
-		for {
-			arguments := p.args(map[string]any{"state": state, "labels": []string{"syntroph-memory", "syntroph-session"}})
-			if cursor != "" {
-				arguments["cursor"] = cursor
+	after := ""
+	for {
+		arguments := p.args(map[string]any{"state": "closed", "labels": []string{"syntroph-memory", "syntroph-session"}})
+		if after != "" {
+			arguments["after"] = after
+		}
+		var page issueListResult
+		if err := client.CallTool(ctx, "list_issues", arguments, &page); err != nil {
+			return issue{}, err
+		}
+		for _, candidate := range page.Issues {
+			if candidate.State != "closed" {
+				continue
 			}
-			var page issueListResult
-			if err := client.CallTool(ctx, "list_issues", arguments, &page); err != nil {
-				return issue{}, err
+			if len(candidate.PullRequest) != 0 && string(candidate.PullRequest) != "null" {
+				continue
 			}
-			for _, candidate := range page.Issues {
-				if len(candidate.PullRequest) != 0 && string(candidate.PullRequest) != "null" {
-					continue
-				}
-				if hasDiaryMarker(candidate.Body, key) {
-					return candidate, nil
-				}
+			if hasDiaryMarker(candidate.Body, key) {
+				return candidate, nil
 			}
-			cursor = page.cursor()
-			if cursor == "" {
-				break
-			}
+		}
+		after = page.cursor()
+		if after == "" {
+			break
 		}
 	}
 	return issue{}, errNotFound
@@ -460,6 +393,7 @@ type issueListResult struct {
 	NextCursor string  `json:"nextCursor"`
 	PageInfo   struct {
 		HasNextPage bool   `json:"hasNextPage"`
+		NextCursor  string `json:"nextCursor"`
 		EndCursor   string `json:"endCursor"`
 	} `json:"pageInfo"`
 }
@@ -469,6 +403,9 @@ func (r issueListResult) cursor() string {
 		return r.NextCursor
 	}
 	if r.PageInfo.HasNextPage {
+		if r.PageInfo.NextCursor != "" {
+			return r.PageInfo.NextCursor
+		}
 		return r.PageInfo.EndCursor
 	}
 	return ""
@@ -496,18 +433,6 @@ func (p *MCPProvider) failed(result storage.MirrorResult, err error) storage.Mir
 func (p *MCPProvider) failedWithRemote(result storage.MirrorResult, remote issue, err error) storage.MirrorResult {
 	result.RemoteID, result.RemoteURL = strconv.Itoa(remote.Number), remote.HTMLURL
 	return p.failed(result, err)
-}
-
-func mcpConflict(result storage.MirrorResult, remote issue, err error) storage.MirrorResult {
-	result.State, result.FailureClass, result.Cause = storage.StorageSyncConflict, storage.FailureConflict, err
-	if remote.Number != 0 {
-		result.RemoteID, result.RemoteURL, result.RemoteRev = strconv.Itoa(remote.Number), remote.HTMLURL, issueRevision(remote)
-		result.RemoteContent, result.EffectiveRemoteHash = remote.Body, hash(remote.Body)
-		if content, exact := stripDiaryMarker(remote.Body, result.Key); exact {
-			result.RemoteContent, result.EffectiveRemoteHash = content, hash(content)
-		}
-	}
-	return result
 }
 
 type mcpProviderError struct {

@@ -244,7 +244,7 @@ func retry(args []string, journal *core.SagaJournal, journalDir string, out inte
 				return err
 			}
 			payload, _ := json.Marshal(result)
-			if err := journal.AppendEvent(context.Background(), core.Event{EventID: item.SagaID + ":storage-retry-result", Type: storageResultEventType(result.State), OccurredAt: time.Now().UTC(), RepositoryID: item.RepositoryID, SagaID: item.SagaID, CorrelationID: item.SagaID, CausationID: e.EventID, SchemaVersion: 1, Payload: payload}); err != nil {
+			if err := journal.AppendEvent(context.Background(), core.Event{EventID: item.SagaID + ":storage-retry-result", Type: storageResultEventType(string(result.State)), OccurredAt: time.Now().UTC(), RepositoryID: item.RepositoryID, SagaID: item.SagaID, CorrelationID: item.SagaID, CausationID: e.EventID, SchemaVersion: 1, Payload: payload}); err != nil {
 				return err
 			}
 		}
@@ -287,11 +287,11 @@ func retryStorage(ctx context.Context, journal *core.SagaJournal, item core.Reco
 	if err != nil {
 		return core.StorageResult{}, err
 	}
-	resolver, ok := port.(core.EventAwareStoragePort)
+	resolver, ok := port.(core.StorageRecoveryPort)
 	if !ok || resolver == nil {
-		return core.StorageResult{}, errors.New("storage adapter is not configured")
+		return core.StorageResult{}, errors.New("storage adapter does not support explicit recovery")
 	}
-	r := resolver.MirrorEvent(ctx, item.SagaID+":storage-retry", diary)
+	r := resolver.RecoverEvent(ctx, item.SagaID+":storage-retry", diary)
 	return r, nil
 }
 
@@ -303,10 +303,10 @@ func journalStorageShutdownFailure(ctx context.Context, journal *core.SagaJourna
 		return err
 	}
 	result := core.StorageResult{
-		EventID: eventID, State: string(storage.StorageSyncPending), Backend: item.Backend,
+		EventID: eventID, State: storage.StorageSyncPending, Backend: core.StorageBackend(item.Backend),
 		Provider: item.Provider, Key: item.IdempotencyKey, RemoteID: item.RemoteID,
 		RemoteURL: item.RemoteURL, RemoteRev: item.RemoteRevision,
-		FailureClass: string(storage.FailureTransient), Error: cause.Error(), Cause: cause,
+		FailureClass: storage.FailureTransient, Error: cause.Error(), Cause: cause,
 	}
 	payload, _ := json.Marshal(result)
 	return journal.AppendEvent(ctx, core.Event{
