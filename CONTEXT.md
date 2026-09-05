@@ -24,6 +24,33 @@ _Avoid_: unsaved memory, lost remote page
 **Storage Sync Conflict**: A mirror whose remote copy diverged from the Syntroph-known revision. In the MVP, the user resolves it explicitly through the CLI; the adapter never silently overwrites it.
 _Avoid_: automatic overwrite, silent merge
 
+**Remote Mirror**: The single remote object corresponding to one immutable Session Diary. It is derived from the diary's Idempotency Key and never aggregates multiple diaries.
+_Avoid_: compiled memory, remote source of truth, shared diary page
+
+**Storage Provider**: The explicitly selected remote integration responsible for one mirror attempt. Changing providers never happens as an automatic fallback.
+_Avoid_: transparent fallback, credential owner
+
+**Remote Binding**: The durable local association between a Session Diary and its Remote Mirror, including backend, provider, remote identity, URL, and observed revision. It is the normal lookup path; marker-based remote search is recovery only.
+_Avoid_: remote cache, source of truth, search result
+
+**Storage Prerequisite Missing**: A non-transient state in which an enabled Storage Provider cannot operate until the user completes an external repository or authentication prerequisite.
+_Avoid_: storage unavailable, automatic setup
+
+**Remote Correction**: An append-only record that makes the local Session Diary the effective version of a divergent Issue mirror without overwriting its existing body.
+_Avoid_: force overwrite, silent merge
+
+**Remote Revision**: A provider-specific immutable reference to the remote version observed by Syntroph and recorded in a Remote Binding.
+_Avoid_: local timestamp, best-effort version
+
+**Provider Capability**: A remote operation that a configured Storage Provider proves it can perform before the first mirror effect.
+_Avoid_: assumed tool, optional permission
+
+**Conflict Snapshot**: A private local copy of divergent remote content retained so recovery can present an offline diff without placing that content in the Remote Binding.
+_Avoid_: remote binding, canonical diary, cached mirror
+
+**Mirror Lock**: The local ownership record that prevents concurrent remote effects for the same Idempotency Key and can only be cleared through verified recovery when orphaned.
+_Avoid_: remote lock, automatic stale lock
+
 **Graph Resolution Pending**: A persisted diary whose code references could not yet be resolved by GraphPort and remain available for later processing.
 _Avoid_: invalid diary, graph failure
 
