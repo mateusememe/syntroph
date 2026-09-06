@@ -1,0 +1,3 @@
+# Safe repository target and storage doctor
+
+Storage derives its destination from the normalized `origin` by default. A different repository requires both an explicit `storage.repository` and `allow_cross_repository: true`; otherwise validation fails before external effects. `syntroph doctor storage` performs the explicit post-clone diagnostic, and `session close` runs the same checks as a non-mutating preflight. Neither path authenticates or repairs configuration. Missing credentials, Wiki bootstrap, provider capabilities, or other external setup records Storage Prerequisite Missing without blocking the local diary.

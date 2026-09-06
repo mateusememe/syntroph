@@ -27,6 +27,9 @@ go.work.sum
 # env file
 .env
 
+# Local operational projections and private remote-recovery evidence
+.syntroph/storage/
+
 # Editor/IDE
 # .idea/
 # .vscode/

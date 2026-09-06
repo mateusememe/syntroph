@@ -153,7 +153,7 @@ func TestMVPEndToEndPendingGraphAndIdempotentScopedRetry(t *testing.T) {
 		t.Fatalf("pending obligations were lost: diary=%+v delivery=%+v", diary, delivery)
 	}
 	pending, err := InspectRecovery(ctx, journal)
-	if err != nil || len(pending) != 1 || pending[0].State != "HandlerPending" {
+	if err != nil || len(pending) != 2 || !containsRecoveryState(pending, "HandlerPending") || !containsRecoveryState(pending, GraphResolutionPending) {
 		t.Fatalf("expected explainable pending recovery: %+v err=%v", pending, err)
 	}
 	// Explicit retry is scoped to the storage handler. Once connectivity is
@@ -176,3 +176,12 @@ func TestMVPEndToEndPendingGraphAndIdempotentScopedRetry(t *testing.T) {
 
 // Small wrappers keep the integration test focused on the public event seam.
 func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
+
+func containsRecoveryState(items []RecoveryItem, state string) bool {
+	for _, item := range items {
+		if item.State == state {
+			return true
+		}
+	}
+	return false
+}

@@ -1,3 +1,3 @@
-# Pluggable GitHub credential providers
+# Pluggable GitHub credential providers (superseded)
 
-GitHub mirror adapters declare `storage.github.provider` as `env-token` or `mcp` and receive an already-authenticated client. Syntroph never stores or prompts for tokens; the provider mechanism remains behind the adapter boundary so either direct GitHub API or a local MCP can be selected without changing the core.
+This initial credential-only naming was superseded by ADRs 0015 and 0016. Configuration now selects one complete storage provider: `github-rest` or `github-mcp` for Issues, and `github-wiki-git` for Wiki. Direct REST accepts only externally injected `SYNTROPH_GITHUB_TOKEN`; MCP and Git own their authentication outside Syntroph. There is no automatic provider fallback.

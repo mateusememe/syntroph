@@ -2,12 +2,44 @@ package core
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+type preflightStorage struct {
+	ready       bool
+	mirrorCalls int
+}
+
+type crashAfterRemoteEffectStorage struct{ effected bool }
+
+func (s *crashAfterRemoteEffectStorage) Preflight(context.Context) StoragePreflightResult {
+	return StoragePreflightResult{Ready: true, Backend: "issues", Provider: "github-rest"}
+}
+
+func (s *crashAfterRemoteEffectStorage) Mirror(context.Context, SessionDiary) StorageResult {
+	s.effected = true
+	panic("simulated process crash after remote effect")
+}
+
+func (s *preflightStorage) Preflight(context.Context) StoragePreflightResult {
+	if s.ready {
+		return StoragePreflightResult{Ready: true, Backend: "issues", Provider: "github-rest", Repository: "mateusememe/syntroph"}
+	}
+	return StoragePreflightResult{
+		Backend: "issues", Provider: "github-rest", Repository: "mateusememe/syntroph",
+		Cause: errors.New("SYNTROPH_GITHUB_TOKEN is not set"),
+	}
+}
+
+func (s *preflightStorage) Mirror(context.Context, SessionDiary) StorageResult {
+	s.mirrorCalls++
+	return StorageResult{State: "mirrored"}
+}
 
 func TestSessionCloseWritesImmutableDiaryAndIsIdempotent(t *testing.T) {
 	store := LocalMemoryStore{Root: filepath.Join(t.TempDir(), ".syntroph", "memory")}
@@ -40,6 +72,21 @@ func TestSessionCloseWritesImmutableDiaryAndIsIdempotent(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Errorf("diary missing %q", want)
 		}
+	}
+}
+
+func TestSessionCloseWithoutBusNeverPerformsUnjournaledRemoteEffect(t *testing.T) {
+	root := t.TempDir()
+	remote := &preflightStorage{ready: true}
+	diary, _, err := (SessionCloser{Memory: LocalMemoryStore{Root: filepath.Join(root, "memory")}, Storage: remote}).Close(context.Background(), SessionCloseRequest{
+		RepositoryID: "github.com/mateusememe/syntroph", CommitSHA: "no-journal", Author: "matt",
+		Format: ArtifactJSON, Artifact: []byte(`{"summary":"local only without journal"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diary.IdempotencyKey == "" || remote.mirrorCalls != 0 {
+		t.Fatalf("diary=%+v unjournaled mirror calls=%d", diary, remote.mirrorCalls)
 	}
 }
 
@@ -79,4 +126,91 @@ func TestParseMarkdownAndManualSummary(t *testing.T) {
 	if err != nil || m.Summary != "manual summary" {
 		t.Fatalf("unexpected manual artifact: %#v %v", m, err)
 	}
+}
+
+func TestSessionClosePersistsDiaryAndPrerequisiteBeforeSkippingMirror(t *testing.T) {
+	root := t.TempDir()
+	journal, err := NewSagaJournal(filepath.Join(root, "journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus, err := NewEventBus(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &preflightStorage{}
+	store := LocalMemoryStore{Root: filepath.Join(root, "memory")}
+	diary, _, err := (SessionCloser{Memory: store, Bus: bus, Storage: remote}).Close(context.Background(), SessionCloseRequest{
+		RepositoryID: "github.com/mateusememe/syntroph", CommitSHA: "abc123", Author: "matt",
+		Format: ArtifactJSON, Artifact: []byte(`{"summary":"safe preflight"}`),
+	})
+	if err != nil {
+		t.Fatalf("missing remote prerequisite failed local close: %v", err)
+	}
+	if remote.mirrorCalls != 0 {
+		t.Fatalf("preflight failure performed %d provider writes", remote.mirrorCalls)
+	}
+	if _, ok, err := store.FindByIdempotencyKey(context.Background(), diary.IdempotencyKey); err != nil || !ok {
+		t.Fatalf("durable local diary missing: ok=%v err=%v", ok, err)
+	}
+	records, err := journal.ReadSaga(context.Background(), diary.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 4 || records[0].Event == nil || records[0].Event.Type != "session.closed" || records[1].Event == nil || records[1].Event.Type != "storage.sync.requested" || records[3].Event == nil || records[3].Event.Type != "storage.prerequisite.missing" {
+		t.Fatalf("unexpected durable preflight sequence: %+v", records)
+	}
+	items, err := InspectRecovery(context.Background(), journal)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("simultaneous graph and storage obligations were not preserved: %+v err=%v", items, err)
+	}
+	states := map[string]string{}
+	for _, item := range items {
+		states[item.State] = item.NextAction
+	}
+	if states["StoragePrerequisiteMissing"] != "syntroph doctor storage" || states[GraphResolutionPending] != "syntroph sync retry --graph" {
+		t.Fatalf("unexpected simultaneous recovery view: %+v", items)
+	}
+}
+
+func TestCrashAfterRemoteEffectLeavesDurableStorageIntentPending(t *testing.T) {
+	root := t.TempDir()
+	journal, err := NewSagaJournal(filepath.Join(root, "journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus, err := NewEventBus(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &crashAfterRemoteEffectStorage{}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected simulated crash")
+			}
+		}()
+		_, _, _ = (SessionCloser{Memory: LocalMemoryStore{Root: filepath.Join(root, "memory")}, Bus: bus, Storage: remote}).Close(context.Background(), SessionCloseRequest{
+			RepositoryID: "github.com/mateusememe/syntroph", CommitSHA: "crash-sha", Author: "matt",
+			Format: ArtifactJSON, Artifact: []byte(`{"summary":"durable intent"}`),
+		})
+	}()
+	if !remote.effected {
+		t.Fatal("simulated remote effect did not execute")
+	}
+	items, err := InspectRecovery(context.Background(), journal)
+	if err != nil || len(items) != 2 || !containsRecoveryState(items, string(StorageSyncPending)) || !containsRecoveryState(items, GraphResolutionPending) {
+		t.Fatalf("interrupted intent was not recoverable: items=%+v err=%v", items, err)
+	}
+	records, err := journal.ReadSaga(context.Background(), diarySagaID(items))
+	if err != nil || len(records) != 2 || records[1].Event == nil || records[1].Event.Type != "storage.sync.requested" {
+		t.Fatalf("intent was not durable before effect: records=%+v err=%v", records, err)
+	}
+}
+
+func diarySagaID(items []RecoveryItem) string {
+	if len(items) == 0 {
+		return ""
+	}
+	return items[0].SagaID
 }

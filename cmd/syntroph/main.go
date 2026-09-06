@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/mateusememe/syntroph/adapters/graphify"
-	"github.com/mateusememe/syntroph/adapters/storageadapter"
 	"github.com/mateusememe/syntroph/core"
 	"github.com/mateusememe/syntroph/storage"
 )
@@ -28,13 +27,16 @@ func main() {
 
 func run(args []string, out, errOut interface{ Write([]byte) (int, error) }) error {
 	if len(args) < 2 {
-		return errors.New("usage: syntroph session close | sync <status|recovery|retry|resolve>")
+		return errors.New("usage: syntroph session close | doctor storage | sync <status|recovery|retry|resolve>")
 	}
 	if args[0] == "session" && args[1] == "close" {
 		return closeSession(args[2:], out, errOut)
 	}
+	if args[0] == "doctor" && args[1] == "storage" {
+		return doctorStorage(args[2:], out, errOut)
+	}
 	if args[0] != "sync" {
-		return errors.New("usage: syntroph session close | sync <status|recovery|retry|resolve>")
+		return errors.New("usage: syntroph session close | doctor storage | sync <status|recovery|retry|resolve>")
 	}
 	journalDir := filepath.Join(".syntroph", "journal")
 	if len(args) >= 3 && strings.HasPrefix(args[1], "--journal=") {
@@ -57,10 +59,31 @@ func run(args []string, out, errOut interface{ Write([]byte) (int, error) }) err
 			return nil
 		}
 		for _, item := range items {
-			fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", item.SagaID, item.State, item.LastError, item.NextAction)
+			fmt.Fprintf(out, "%s\t%s\tprovider=%s\tremote=%s\trevision=%s\tfailure=%s\tevidence=%s\terror=%s\tnext=%s\n", item.SagaID, item.State, item.Provider, item.RemoteID, item.RemoteRevision, item.FailureClass, item.ConflictSnapshot, item.LastError, item.NextAction)
 		}
 		return nil
 	case "recovery":
+		fs := flag.NewFlagSet("sync recovery", flag.ContinueOnError)
+		fs.SetOutput(os.Stderr)
+		clearLock := fs.String("clear-lock", "", "clear a verified orphaned mirror lock")
+		root := fs.String("root", filepath.Dir(journalDir), "Syntroph data root")
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return errors.New("sync recovery accepts only --clear-lock and --root")
+		}
+		if *clearLock != "" {
+			locks, err := storage.NewMirrorLocks(filepath.Join(*root, "storage"))
+			if err != nil {
+				return err
+			}
+			if err := locks.ClearOrphan(ctx, *clearLock); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "Verified orphaned mirror lock cleared: %s. No external effect was executed.\n", *clearLock)
+			return nil
+		}
 		items, e := core.InspectRecovery(ctx, j)
 		if e != nil {
 			return e
@@ -71,7 +94,7 @@ func run(args []string, out, errOut interface{ Write([]byte) (int, error) }) err
 		}
 		fmt.Fprintln(out, "Recovery plan (no external effects are executed automatically):")
 		for _, item := range items {
-			fmt.Fprintf(out, "- saga %s: %s; attempts: %d; last error: %s; next: %s\n", item.SagaID, item.State, len(item.Attempts), item.LastError, item.NextAction)
+			fmt.Fprintf(out, "- saga %s: %s; provider: %s; remote: %s %s; revision: %s; failure: %s; evidence: %s; attempts: %d; last error: %s; next: %s\n", item.SagaID, item.State, item.Provider, item.RemoteID, item.RemoteURL, item.RemoteRevision, item.FailureClass, item.ConflictSnapshot, len(item.Attempts), item.LastError, item.NextAction)
 			for _, attempt := range item.Attempts {
 				fmt.Fprintf(out, "  attempt %s/%s at %s: %s", attempt.HandlerID, attempt.EventID, attempt.AttemptedAt.Format(time.RFC3339Nano), attempt.Outcome)
 				if attempt.Error != "" {
@@ -119,15 +142,15 @@ func closeSession(args []string, out, errOut interface{ Write([]byte) (int, erro
 	}
 	memory := core.LocalMemoryStore{Root: filepath.Join(*root, "memory")}
 	// LocalGraphPort is the deterministic default. Set graphify_executable in
-	// .syntroph/config.json to exercise the optional real adapter.
+	// .syntroph/config.yaml to exercise the optional real adapter.
 	var graph core.GraphPort
-	if executable := configuredString(filepath.Join(*root, "config.json"), "graphify_executable"); executable != "" {
+	if executable := configuredGraphExecutable(*root); executable != "" {
 		graph = graphify.New(executable)
 	} else if local, e := core.NewLocalGraphPort(filepath.Join(*root, "graph")); e == nil {
 		graph = local
 	}
 	formatValue := core.ArtifactFormat(strings.ToLower(*format))
-	storagePort := configuredStorage(filepath.Join(*root, "config.json"))
+	storagePort := configuredStorage(*root, filepath.Dir(*root))
 	diary, delivery, err := (core.SessionCloser{Memory: memory, Bus: bus, Graph: graph, Storage: storagePort}).Close(context.Background(), core.SessionCloseRequest{RepositoryID: *repo, CommitSHA: *sha, Author: *author, Runtime: *runtime, Artifact: data, Format: formatValue, ManualSummary: *summary})
 	if err != nil {
 		return err
@@ -138,48 +161,6 @@ func closeSession(args []string, out, errOut interface{ Write([]byte) (int, erro
 	}{diary, delivery}, "", "  ")
 	_, _ = out.Write(append(b, '\n'))
 	return nil
-}
-
-func configuredString(path, key string) string {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	var cfg map[string]string
-	if json.Unmarshal(b, &cfg) != nil {
-		return ""
-	}
-	return strings.TrimSpace(cfg[key])
-}
-
-// configuredStorage keeps provider selection at the adapter boundary. A
-// missing authenticated client is represented as a pending mirror, never as
-// a silently skipped synchronization.
-func configuredStorage(path string) core.StoragePort {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	var cfg struct {
-		Storage struct {
-			Backend string `json:"backend"`
-			GitHub  struct {
-				Provider   string `json:"provider"`
-				Repository string `json:"repository"`
-			} `json:"github"`
-		} `json:"storage"`
-	}
-	if json.Unmarshal(b, &cfg) != nil || cfg.Storage.Backend == "" {
-		return nil
-	}
-	backend := storage.Backend(cfg.Storage.Backend)
-	if backend != storage.BackendWiki && backend != storage.BackendIssues {
-		return nil
-	}
-	// Authentication/client construction is deliberately delegated to the
-	// configured provider. Until a local provider is installed, this adapter
-	// remains visible as StorageSyncPending and is recoverable.
-	return storageadapter.Adapter{Provider: nil}
 }
 
 func retry(args []string, journal *core.SagaJournal, journalDir string, out interface{ Write([]byte) (int, error) }) error {
@@ -200,9 +181,32 @@ func retry(args []string, journal *core.SagaJournal, journalDir string, out inte
 	if err != nil {
 		return err
 	}
+	var storagePort core.StoragePort
+	var storageLifecycle interface {
+		BeginCommand()
+		EndCommand() error
+	}
+	storageLifecycleEnded := false
+	if scope == "storage" {
+		syntrophRoot := filepath.Dir(journalDir)
+		storagePort = configuredStorage(syntrophRoot, filepath.Dir(syntrophRoot))
+		if lifecycle, ok := storagePort.(interface {
+			BeginCommand()
+			EndCommand() error
+		}); ok {
+			storageLifecycle = lifecycle
+			storageLifecycle.BeginCommand()
+			defer func() {
+				if !storageLifecycleEnded {
+					_ = storageLifecycle.EndCommand()
+				}
+			}()
+		}
+	}
 	count := 0
+	var storageItems []core.RecoveryItem
 	for _, item := range items {
-		if (scope == "graph" && item.State != core.GraphResolutionPending && item.State != core.GraphSyncPending) || (scope == "storage" && item.State != "StorageSyncPending") {
+		if (scope == "graph" && item.State != core.GraphResolutionPending && item.State != core.GraphSyncPending) || (scope == "storage" && item.State != "StorageSyncPending" && item.State != "StoragePrerequisiteMissing") {
 			continue
 		}
 		e := core.Event{EventID: item.SagaID + ":retry:" + scope, Type: "sync.retry.requested", OccurredAt: time.Now().UTC(), RepositoryID: item.RepositoryID, SagaID: item.SagaID, CorrelationID: item.SagaID, CausationID: item.EventID, SchemaVersion: 1, Payload: []byte(fmt.Sprintf(`{"scope":%q}`, scope))}
@@ -221,18 +225,43 @@ func retry(args []string, journal *core.SagaJournal, journalDir string, out inte
 				return err
 			}
 		} else {
-			if err := retryStorage(context.Background(), journal, journalDir, item); err != nil {
-				if appendErr := journal.AppendAttempt(context.Background(), core.HandlerAttempt{EventID: e.EventID, SagaID: item.SagaID, HandlerID: "storage-retry", AttemptedAt: time.Now().UTC(), Outcome: "failed", Error: err.Error()}); appendErr != nil {
+			storageItems = append(storageItems, item)
+			result, retryErr := retryStorage(context.Background(), journal, item, storagePort)
+			if retryErr != nil {
+				diagnostic := core.SafeStorageDiagnostic(retryErr.Error())
+				if appendErr := journal.AppendAttempt(context.Background(), core.HandlerAttempt{EventID: e.EventID, SagaID: item.SagaID, HandlerID: "storage-retry", AttemptedAt: time.Now().UTC(), Outcome: "failed", Error: diagnostic}); appendErr != nil {
 					return appendErr
 				}
 				continue
 			}
-			if err := journal.AppendAttempt(context.Background(), core.HandlerAttempt{EventID: e.EventID, SagaID: item.SagaID, HandlerID: "storage-retry", AttemptedAt: time.Now().UTC(), Outcome: "succeeded"}); err != nil {
+			result = core.StorageResultForJournal(result)
+			attempt := core.HandlerAttempt{EventID: e.EventID, SagaID: item.SagaID, HandlerID: "storage-retry", AttemptedAt: time.Now().UTC(), Outcome: "succeeded"}
+			if result.State != "mirrored" {
+				attempt.Outcome = "failed"
+				attempt.Error = result.Error
+			}
+			if err := journal.AppendAttempt(context.Background(), attempt); err != nil {
 				return err
 			}
-			_ = journal.AppendEvent(context.Background(), core.Event{EventID: item.SagaID + ":storage-succeeded", Type: "storage.sync.succeeded", OccurredAt: time.Now().UTC(), RepositoryID: item.RepositoryID, SagaID: item.SagaID, CorrelationID: item.SagaID, CausationID: e.EventID, SchemaVersion: 1, Payload: []byte(`{"state":"mirrored"}`)})
+			payload, _ := json.Marshal(result)
+			if err := journal.AppendEvent(context.Background(), core.Event{EventID: item.SagaID + ":storage-retry-result", Type: core.StorageEventType(result.State), OccurredAt: time.Now().UTC(), RepositoryID: item.RepositoryID, SagaID: item.SagaID, CorrelationID: item.SagaID, CausationID: e.EventID, SchemaVersion: 1, Payload: payload}); err != nil {
+				return err
+			}
 		}
 		count++
+	}
+	if storageLifecycle != nil {
+		closeErr := storageLifecycle.EndCommand()
+		storageLifecycleEnded = true
+		if closeErr != nil {
+			diagnostic := core.SafeStorageDiagnostic(closeErr.Error())
+			for _, item := range storageItems {
+				if err := journalStorageShutdownFailure(context.Background(), journal, item, closeErr); err != nil {
+					return err
+				}
+			}
+			fmt.Fprintf(out, "MCP shutdown failed after the storage retry and was journaled for %d saga(s): %s\n", len(storageItems), diagnostic)
+		}
 	}
 	fmt.Fprintf(out, "Retry requested for %s synchronization for %d saga(s). External effects require the configured adapter.\n", scope, count)
 	return nil
@@ -254,24 +283,39 @@ func diaryFromSaga(ctx context.Context, journal *core.SagaJournal, saga string) 
 	return core.SessionDiary{}, errors.New("session diary not found in saga journal")
 }
 
-func retryStorage(ctx context.Context, journal *core.SagaJournal, journalDir string, item core.RecoveryItem) error {
+func retryStorage(ctx context.Context, journal *core.SagaJournal, item core.RecoveryItem, port core.StoragePort) (core.StorageResult, error) {
 	diary, err := diaryFromSaga(ctx, journal, item.SagaID)
 	if err != nil {
+		return core.StorageResult{}, err
+	}
+	resolver, ok := port.(core.StorageRecoveryPort)
+	if !ok || resolver == nil {
+		return core.StorageResult{}, errors.New("storage adapter does not support explicit recovery")
+	}
+	r := resolver.RecoverEvent(ctx, item.SagaID+":storage-retry", diary)
+	return r, nil
+}
+
+func journalStorageShutdownFailure(ctx context.Context, journal *core.SagaJournal, item core.RecoveryItem, cause error) error {
+	now := time.Now().UTC()
+	eventID := fmt.Sprintf("%s:storage-shutdown:%d", item.SagaID, now.UnixNano())
+	diagnostic := core.SafeStorageDiagnostic(cause.Error())
+	attempt := core.HandlerAttempt{EventID: eventID, SagaID: item.SagaID, HandlerID: "storage-shutdown", AttemptedAt: now, Outcome: "failed", Error: diagnostic}
+	if err := journal.AppendAttempt(ctx, attempt); err != nil {
 		return err
 	}
-	port := configuredStorage(filepath.Join(filepath.Dir(filepath.Dir(journalDir)), "config.json"))
-	resolver, ok := port.(core.EventAwareStoragePort)
-	if !ok || resolver == nil {
-		return errors.New("storage adapter is not configured")
+	result := core.StorageResult{
+		EventID: eventID, State: storage.StorageSyncPending, Backend: core.StorageBackend(item.Backend),
+		Provider: item.Provider, Key: item.IdempotencyKey, RemoteID: item.RemoteID,
+		RemoteURL: item.RemoteURL, RemoteRev: item.RemoteRevision,
+		FailureClass: storage.FailureTransient, Error: diagnostic, Cause: cause,
 	}
-	r := resolver.MirrorEvent(ctx, item.SagaID+":storage-retry", diary)
-	if r.State != "mirrored" {
-		if r.Cause != nil {
-			return r.Cause
-		}
-		return errors.New("storage synchronization remains pending")
-	}
-	return nil
+	payload, _ := json.Marshal(result)
+	return journal.AppendEvent(ctx, core.Event{
+		EventID: eventID, Type: "storage.sync.pending", OccurredAt: now,
+		RepositoryID: item.RepositoryID, SagaID: item.SagaID, CorrelationID: item.SagaID,
+		CausationID: item.EventID, SchemaVersion: 1, Payload: payload,
+	})
 }
 
 func retryGraph(ctx context.Context, journal *core.SagaJournal, item core.RecoveryItem) error {
@@ -305,7 +349,7 @@ func resolve(args []string, out interface{ Write([]byte) (int, error) }) error {
 	}
 	fs := flag.NewFlagSet("sync resolve", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	local, remote, keepLocal, keepRemote := fs.String("local-file", "", "local canonical content"), fs.String("remote-file", "", "remote content observed"), fs.Bool("keep-local", false, "overwrite remote with local content"), fs.Bool("keep-remote", false, "acknowledge remote content")
+	local, remote, keepLocal, keepRemote := fs.String("local-file", "", "local canonical content"), fs.String("remote-file", "", "remote content observed"), fs.Bool("keep-local", false, "append a correction containing local content"), fs.Bool("keep-remote", false, "acknowledge remote content")
 	revision, root := fs.String("revision", "", "remote revision observed during diff"), fs.String("root", ".syntroph", "Syntroph data root")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -327,23 +371,66 @@ func resolve(args []string, out interface{ Write([]byte) (int, error) }) error {
 		if err != nil {
 			return err
 		}
-		port := configuredStorage(filepath.Join(*root, "config.json"))
+		items, err := core.InspectRecovery(context.Background(), journal)
+		if err != nil {
+			return err
+		}
+		var conflict core.RecoveryItem
+		for _, item := range items {
+			if item.SagaID == fs.Arg(0) && item.State == "StorageSyncConflict" {
+				conflict = item
+				break
+			}
+		}
+		if conflict.State != "StorageSyncConflict" || conflict.ConflictSnapshot == "" {
+			return errors.New("sync resolve requires a persisted storage conflict with offline diff evidence")
+		}
+		remoteContent, err := os.ReadFile(conflict.ConflictSnapshot)
+		if err != nil {
+			return fmt.Errorf("read remote conflict snapshot: %w", err)
+		}
+		localContent := core.RenderSessionDiary(diary)
+		fmt.Fprintf(out, "Conflict %s\n--- local\n%s\n--- remote\n%s\n", fs.Arg(0), localContent, remoteContent)
+		port := configuredStorage(*root, filepath.Dir(*root))
 		resolver, ok := port.(core.StorageResolver)
 		if !ok || resolver == nil {
 			return errors.New("sync resolve requires --local-file and --remote-file, or a configured storage adapter")
 		}
-		if *revision == "" {
-			return errors.New("sync resolve requires --revision for remote validation")
+		observedRevision := conflict.RemoteRevision
+		if *revision != "" && *revision != observedRevision {
+			return errors.New("--revision does not match the revision persisted with the displayed conflict")
 		}
-		r := resolver.Resolve(context.Background(), diary, map[bool]string{true: "keep-local", false: "keep-remote"}[*keepLocal], *revision)
+		if observedRevision == "" {
+			return errors.New("storage conflict does not contain an observed remote revision")
+		}
+		choice := map[bool]string{true: "keep-local", false: "keep-remote"}[*keepLocal]
+		r := core.StorageResultForJournal(resolver.Resolve(context.Background(), diary, choice, observedRevision))
+		attempt := core.HandlerAttempt{EventID: fs.Arg(0) + ":storage-resolve", SagaID: fs.Arg(0), HandlerID: "storage-resolve", AttemptedAt: time.Now().UTC(), Outcome: "succeeded"}
 		if r.State != "mirrored" {
-			if r.Cause != nil {
-				return r.Cause
+			attempt.Outcome = "failed"
+			if r.Error != "" {
+				attempt.Error = r.Error
+				if err := journal.AppendAttempt(context.Background(), attempt); err != nil {
+					return err
+				}
+				payload, _ := json.Marshal(r)
+				if err := journal.AppendEvent(context.Background(), core.Event{EventID: fs.Arg(0) + ":storage-resolve-result", Type: core.StorageEventType(r.State), OccurredAt: time.Now().UTC(), RepositoryID: diary.RepositoryID, SagaID: fs.Arg(0), CorrelationID: fs.Arg(0), CausationID: attempt.EventID, SchemaVersion: 1, Payload: payload}); err != nil {
+					return err
+				}
+				return errors.New(r.Error)
 			}
+			attempt.Error = "storage conflict remains unresolved"
+			_ = journal.AppendAttempt(context.Background(), attempt)
 			return errors.New("storage conflict remains unresolved")
 		}
-		_ = journal.AppendEvent(context.Background(), core.Event{EventID: fs.Arg(0) + ":storage-resolved", Type: "storage.sync.resolved", OccurredAt: time.Now().UTC(), RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: fs.Arg(0), SchemaVersion: 1, Payload: []byte(`{"state":"mirrored"}`)})
-		fmt.Fprintf(out, "Resolution recorded: %s.\n", map[bool]string{true: "keep-local", false: "keep-remote"}[*keepLocal])
+		if err := journal.AppendAttempt(context.Background(), attempt); err != nil {
+			return err
+		}
+		payload, _ := json.Marshal(r)
+		if err := journal.AppendEvent(context.Background(), core.Event{EventID: fs.Arg(0) + ":storage-resolved", Type: "storage.sync.resolved", OccurredAt: time.Now().UTC(), RepositoryID: diary.RepositoryID, SagaID: fs.Arg(0), CorrelationID: fs.Arg(0), CausationID: conflict.EventID, SchemaVersion: 1, Payload: payload}); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Resolution recorded: %s.\n", choice)
 		return nil
 	}
 	if *local == "" || *remote == "" {

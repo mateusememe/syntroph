@@ -91,6 +91,7 @@ func (j *SagaJournal) AppendEvent(ctx context.Context, e Event) error {
 	return j.append(ctx, e.SagaID, JournalRecord{Kind: "event", Event: &e})
 }
 func (j *SagaJournal) AppendAttempt(ctx context.Context, a HandlerAttempt) error {
+	a.Error = SafeStorageDiagnostic(a.Error)
 	if err := a.Validate(); err != nil {
 		return err
 	}

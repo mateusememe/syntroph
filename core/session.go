@@ -179,25 +179,44 @@ type StoragePort interface {
 	Mirror(context.Context, SessionDiary) StorageResult
 }
 
+// StoragePreflightPort exposes the same non-mutating prerequisite check used
+// by `syntroph doctor storage`. Session close invokes it only after the local
+// diary and session.closed event are durable.
+type StoragePreflightPort interface {
+	Preflight(context.Context) StoragePreflightResult
+}
+
+type StoragePreflightCheck struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Detail string `json:"detail"`
+	Action string `json:"action,omitempty"`
+}
+
+type StoragePreflightResult struct {
+	Enabled    bool                    `json:"enabled"`
+	Ready      bool                    `json:"ready"`
+	Backend    string                  `json:"backend,omitempty"`
+	Provider   string                  `json:"provider,omitempty"`
+	Repository string                  `json:"repository,omitempty"`
+	Checks     []StoragePreflightCheck `json:"checks,omitempty"`
+	Cause      error                   `json:"-"`
+}
+
 // EventAwareStoragePort lets external mirrors use the immutable event ID as
 // their idempotency key while retaining the diary's artifact key.
 type EventAwareStoragePort interface {
 	MirrorEvent(context.Context, string, SessionDiary) StorageResult
 }
 
-type StorageResolver interface {
-	Resolve(context.Context, SessionDiary, string, string) StorageResult
+// StorageRecoveryPort is the only Core path allowed to perform marker-based
+// discovery when the operational Remote Binding is missing.
+type StorageRecoveryPort interface {
+	RecoverEvent(context.Context, string, SessionDiary) StorageResult
 }
 
-type StorageResult struct {
-	EventID     string
-	State       string
-	Backend     string
-	Key         string
-	RemoteID    string
-	RemoteRev   string
-	ExpectedRev string
-	Cause       error
+type StorageResolver interface {
+	Resolve(context.Context, SessionDiary, string, string) StorageResult
 }
 
 type SessionCloser struct {
@@ -263,27 +282,75 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 	if err := c.Memory.SaveDiary(ctx, diary); err != nil {
 		return SessionDiary{}, Delivery{}, err
 	}
-	var storageResult StorageResult
-	if c.Storage != nil {
-		if mirror, ok := c.Storage.(EventAwareStoragePort); ok {
-			storageResult = mirror.MirrorEvent(ctx, diary.SessionID, diary)
-		} else {
-			storageResult = c.Storage.Mirror(ctx, diary)
-		}
-	}
-	if c.Bus == nil {
-		return diary, Delivery{EventID: diary.SessionID}, nil
-	}
 	payload, _ := json.Marshal(diary)
 	e := Event{EventID: diary.SessionID, Type: "session.closed", OccurredAt: now, RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, SchemaVersion: 1, Payload: payload}
+	if c.Bus == nil {
+		// Remote effects require a durable intent and outcome. Without an Event
+		// Bus backed by the Saga Journal, the local diary is the only safe effect.
+		return diary, Delivery{EventID: diary.SessionID}, nil
+	}
 	delivery, err := c.Bus.Publish(ctx, e)
-	if err == nil && c.Storage != nil && storageResult.State != "mirrored" {
-		// The diary remains successful locally; the mirror obligation is
-		// surfaced by a causal event and can be retried explicitly.
-		pending, _ := json.Marshal(storageResult)
-		storageEvent := Event{EventID: diary.SessionID + ":storage", Type: "storage.sync.pending", OccurredAt: now, RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: e.EventID, SchemaVersion: 1, Payload: pending}
-		if journal, ok := c.Bus.journal.(*SagaJournal); ok {
-			_ = journal.AppendEvent(ctx, storageEvent)
+	if err != nil || c.Storage == nil {
+		return diary, delivery, err
+	}
+
+	// A durable intent is appended before the first remote effect. A restart
+	// surfaces an interrupted mirror but never replays it automatically.
+	storageEventID := diary.SessionID + ":storage"
+	var storageResult StorageResult
+	preflightReady := true
+	intent := StorageResult{EventID: storageEventID, State: StorageSyncPending, Key: diary.IdempotencyKey, FailureClass: StorageFailureTransient}
+	if preflight, ok := c.Storage.(StoragePreflightPort); ok {
+		check := preflight.Preflight(ctx)
+		intent.Backend, intent.Provider = StorageBackend(check.Backend), check.Provider
+		preflightReady = check.Ready
+		if !check.Ready {
+			cause := check.Cause
+			if cause == nil {
+				cause = errors.New("storage prerequisites are missing")
+			}
+			storageResult = StorageResult{
+				EventID: storageEventID, State: "StoragePrerequisiteMissing",
+				Backend: StorageBackend(check.Backend), Provider: check.Provider,
+				FailureClass: "prerequisite_missing", Error: cause.Error(), Cause: cause,
+			}
+		}
+	}
+	if journal, ok := c.Bus.journal.(*SagaJournal); ok {
+		intentPayload, _ := json.Marshal(intent)
+		intentEvent := Event{EventID: storageEventID, Type: "storage.sync.requested", OccurredAt: time.Now().UTC(), RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: e.EventID, SchemaVersion: 1, Payload: intentPayload}
+		if appendErr := journal.AppendEvent(ctx, intentEvent); appendErr != nil {
+			return diary, delivery, appendErr
+		}
+	}
+	if preflightReady {
+		if mirror, ok := c.Storage.(EventAwareStoragePort); ok {
+			storageResult = mirror.MirrorEvent(ctx, storageEventID, diary)
+		} else {
+			storageResult = c.Storage.Mirror(ctx, diary)
+			storageResult.EventID = storageEventID
+		}
+	}
+	storageResult = StorageResultForJournal(storageResult)
+	if journal, ok := c.Bus.journal.(*SagaJournal); ok {
+		attempt := HandlerAttempt{EventID: storageEventID, SagaID: diary.SessionID, HandlerID: "storage-mirror", AttemptedAt: time.Now().UTC(), Outcome: "succeeded"}
+		if storageResult.State != "mirrored" {
+			attempt.Outcome, attempt.Error = "failed", storageResult.Error
+		}
+		if storageResult.AlreadyInProgress {
+			attempt.Outcome = "skipped"
+		}
+		if appendErr := journal.AppendAttempt(ctx, attempt); appendErr != nil {
+			return diary, delivery, appendErr
+		}
+		delivery.Attempts = append(delivery.Attempts, attempt)
+		// A concurrent attempt is diagnostic, not another pending obligation.
+		if !storageResult.AlreadyInProgress {
+			outcomePayload, _ := json.Marshal(storageResult)
+			storageEvent := Event{EventID: storageEventID + ":outcome", Type: StorageEventType(storageResult.State), OccurredAt: time.Now().UTC(), RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: storageEventID, SchemaVersion: 1, Payload: outcomePayload}
+			if appendErr := journal.AppendEvent(ctx, storageEvent); appendErr != nil {
+				return diary, delivery, appendErr
+			}
 		}
 	}
 	return diary, delivery, err

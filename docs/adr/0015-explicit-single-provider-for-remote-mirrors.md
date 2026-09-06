@@ -1,0 +1,5 @@
+# Explicit single provider for remote mirrors
+
+Each installation selects exactly one storage provider and never falls back automatically between GitHub API and MCP, because replaying one logical mirror through different transports can duplicate effects or lose the observed revision. Direct GitHub API defines the reference contract; MCP is an alternative implementation of that contract. Every immutable Session Diary maps to one remote object by Idempotency Key, while future aggregation belongs to Compiled Memory.
+
+Syntroph attempts the configured mirror only after the local diary is durable. Remote failure records Storage Sync Pending without failing session close, and retry remains explicit. Credentials are injected by the environment or a GitHub App; an MCP process owns its own authentication. Syntroph never initiates login, reads private `gh` credential files, or stores tokens. Post-clone diagnostics and installation documentation must explain the external authentication prerequisite when a remote provider is enabled.

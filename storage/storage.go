@@ -9,63 +9,46 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+
+	"github.com/mateusememe/syntroph/core/storagecontract"
 )
 
 var (
-	ErrUnavailable = errors.New("storage mirror unavailable")
-	ErrConflict    = errors.New("storage mirror conflict")
+	ErrUnavailable         = errors.New("storage mirror unavailable")
+	ErrConflict            = errors.New("storage mirror conflict")
+	ErrPrerequisiteMissing = errors.New("storage prerequisite missing")
+	ErrMirrorInProgress    = errors.New("storage mirror already in progress")
 )
 
-type Backend string
+type Backend = storagecontract.Backend
 
 const (
-	BackendWiki   Backend = "wiki"
-	BackendIssues Backend = "issues"
+	BackendWiki   = storagecontract.BackendWiki
+	BackendIssues = storagecontract.BackendIssues
 )
 
-type MirrorState string
+type MirrorState = storagecontract.State
 
 const (
-	Mirrored            MirrorState = "mirrored"
-	StorageSyncPending  MirrorState = "StorageSyncPending"
-	StorageSyncConflict MirrorState = "StorageSyncConflict"
+	Mirrored                   = storagecontract.Mirrored
+	StorageSyncPending         = storagecontract.SyncPending
+	StorageSyncConflict        = storagecontract.SyncConflict
+	StoragePrerequisiteMissing = storagecontract.PrerequisiteMissing
+)
+
+type FailureClass = storagecontract.FailureClass
+
+const (
+	FailureTransient         = storagecontract.FailureTransient
+	FailureConflict          = storagecontract.FailureConflict
+	FailurePrerequisite      = storagecontract.FailurePrerequisite
+	FailureAlreadyInProgress = storagecontract.FailureAlreadyInProgress
 )
 
 // SessionDiary is the immutable local document handed to a mirror. Mirrors
 // must never mutate it or use the remote copy as the canonical source.
-type SessionDiary struct {
-	SessionID    string
-	RepositoryID string
-	CommitSHA    string
-	ArtifactHash string
-	Content      string
-}
-
-func (d SessionDiary) Validate() error {
-	if d.SessionID == "" || d.RepositoryID == "" || d.CommitSHA == "" || d.ArtifactHash == "" || d.Content == "" {
-		return errors.New("session diary is missing required fields")
-	}
-	return nil
-}
-
-func (d SessionDiary) Key() string {
-	h := sha256.New()
-	fmt.Fprintf(h, "%s\x00%s\x00%s", d.RepositoryID, d.CommitSHA, d.ArtifactHash)
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-type MirrorResult struct {
-	State       MirrorState
-	Backend     Backend
-	Key         string
-	RemoteID    string
-	RemoteRev   string
-	ExpectedRev string
-	Cause       error
-}
-
-func (r MirrorResult) Pending() bool  { return r.State == StorageSyncPending }
-func (r MirrorResult) Conflict() bool { return r.State == StorageSyncConflict }
+type SessionDiary = storagecontract.Diary
+type MirrorResult = storagecontract.Result
 
 // StoragePort mirrors a durable local Session Diary. Implementations must be
 // idempotent for diary.Key and must report remote divergence instead of
@@ -79,6 +62,7 @@ type StoragePort interface {
 // Wiki page or Issue mirror.
 type RemoteDocument struct {
 	ID       string
+	URL      string
 	Revision string
 	Content  string
 	NotFound bool
@@ -109,52 +93,78 @@ func NewMirror(backend Backend, repository string, client GitHubClient) (*Mirror
 }
 
 func (m *Mirror) Mirror(ctx context.Context, diary SessionDiary) MirrorResult {
-	r := MirrorResult{Backend: m.Backend, Key: diary.Key()}
+	r := MirrorResult{Backend: m.Backend, Key: diary.Key(), LocalHash: contentHash(diary.Content)}
 	if err := diary.Validate(); err != nil {
-		r.State, r.Cause = StorageSyncPending, err
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, err
 		return r
 	}
 	remote, err := m.Client.Get(ctx, m.Backend, m.Repository, r.Key)
 	if err != nil {
-		r.State, r.Cause = StorageSyncPending, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		if errors.Is(err, ErrPrerequisiteMissing) {
+			r.State, r.FailureClass, r.Cause = StoragePrerequisiteMissing, FailurePrerequisite, err
+			return r
+		}
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, fmt.Errorf("%w: %v", ErrUnavailable, err)
 		return r
 	}
 	if !remote.NotFound && remote.Content == diary.Content {
-		r.State, r.RemoteID, r.RemoteRev = Mirrored, remote.ID, remote.Revision
+		r.State, r.RemoteID, r.RemoteURL, r.RemoteRev = Mirrored, remote.ID, remote.URL, remote.Revision
+		r.EffectiveRemoteHash = contentHash(remote.Content)
 		return r
 	}
 	if !remote.NotFound {
-		r.State, r.RemoteID, r.RemoteRev, r.ExpectedRev = StorageSyncConflict, remote.ID, remote.Revision, ""
-		r.Cause = ErrConflict
+		r.State, r.FailureClass = StorageSyncConflict, FailureConflict
+		r.RemoteID, r.RemoteURL, r.RemoteRev, r.ExpectedRev = remote.ID, remote.URL, remote.Revision, ""
+		r.RemoteContent, r.EffectiveRemoteHash, r.Cause = remote.Content, contentHash(remote.Content), ErrConflict
 		return r
 	}
 	created, err := m.Client.Put(ctx, m.Backend, m.Repository, r.Key, diary.Content, "")
 	if err != nil {
-		r.State, r.Cause = StorageSyncPending, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		if errors.Is(err, ErrPrerequisiteMissing) {
+			r.State, r.FailureClass, r.Cause = StoragePrerequisiteMissing, FailurePrerequisite, err
+			return r
+		}
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, fmt.Errorf("%w: %v", ErrUnavailable, err)
 		return r
 	}
-	r.State, r.RemoteID, r.RemoteRev = Mirrored, created.ID, created.Revision
+	r.State, r.RemoteID, r.RemoteURL, r.RemoteRev = Mirrored, created.ID, created.URL, created.Revision
+	r.EffectiveRemoteHash = contentHash(created.Content)
+	if r.EffectiveRemoteHash == contentHash("") {
+		r.EffectiveRemoteHash = r.LocalHash
+	}
 	return r
 }
 
+// Recover performs the same deterministic key lookup for the legacy generic
+// client seam. Concrete GitHub providers implement their own recovery-only
+// marker discovery.
+func (m *Mirror) Recover(ctx context.Context, diary SessionDiary) MirrorResult {
+	return m.Mirror(ctx, diary)
+}
+
 func (m *Mirror) Status(ctx context.Context, diary SessionDiary) MirrorResult {
-	r := MirrorResult{Backend: m.Backend, Key: diary.Key()}
+	r := MirrorResult{Backend: m.Backend, Key: diary.Key(), LocalHash: contentHash(diary.Content)}
 	if err := diary.Validate(); err != nil {
-		r.State, r.Cause = StorageSyncPending, err
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, err
 		return r
 	}
 	remote, err := m.Client.Get(ctx, m.Backend, m.Repository, r.Key)
 	if err != nil {
-		r.State, r.Cause = StorageSyncPending, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		if errors.Is(err, ErrPrerequisiteMissing) {
+			r.State, r.FailureClass, r.Cause = StoragePrerequisiteMissing, FailurePrerequisite, err
+			return r
+		}
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, fmt.Errorf("%w: %v", ErrUnavailable, err)
 		return r
 	}
 	if remote.NotFound {
-		r.State, r.Cause = StorageSyncPending, errors.New("remote document not found")
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, errors.New("remote document not found")
 		return r
 	}
-	r.RemoteID, r.RemoteRev = remote.ID, remote.Revision
+	r.RemoteID, r.RemoteURL, r.RemoteRev = remote.ID, remote.URL, remote.Revision
+	r.RemoteContent, r.EffectiveRemoteHash = remote.Content, contentHash(remote.Content)
 	if remote.Content != diary.Content {
-		r.State, r.Cause = StorageSyncConflict, ErrConflict
+		r.State, r.FailureClass, r.Cause = StorageSyncConflict, FailureConflict, ErrConflict
 		return r
 	}
 	r.State = Mirrored
@@ -172,19 +182,24 @@ const (
 )
 
 func (m *Mirror) Resolve(ctx context.Context, diary SessionDiary, choice Resolution, observedRevision string) MirrorResult {
-	r := MirrorResult{Backend: m.Backend, Key: diary.Key()}
+	r := MirrorResult{Backend: m.Backend, Key: diary.Key(), LocalHash: contentHash(diary.Content)}
 	if choice != KeepLocal && choice != KeepRemote {
-		r.State, r.Cause = StorageSyncConflict, errors.New("resolution must be keep-local or keep-remote")
+		r.State, r.FailureClass, r.Cause = StorageSyncConflict, FailureConflict, errors.New("resolution must be keep-local or keep-remote")
 		return r
 	}
 	remote, err := m.Client.Get(ctx, m.Backend, m.Repository, r.Key)
 	if err != nil {
-		r.State, r.Cause = StorageSyncPending, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		if errors.Is(err, ErrPrerequisiteMissing) {
+			r.State, r.FailureClass, r.Cause = StoragePrerequisiteMissing, FailurePrerequisite, err
+			return r
+		}
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, fmt.Errorf("%w: %v", ErrUnavailable, err)
 		return r
 	}
-	r.RemoteID, r.RemoteRev, r.ExpectedRev = remote.ID, remote.Revision, observedRevision
+	r.RemoteID, r.RemoteURL, r.RemoteRev, r.ExpectedRev = remote.ID, remote.URL, remote.Revision, observedRevision
+	r.RemoteContent, r.EffectiveRemoteHash = remote.Content, contentHash(remote.Content)
 	if observedRevision == "" || remote.Revision != observedRevision {
-		r.State, r.Cause = StorageSyncConflict, ErrConflict
+		r.State, r.FailureClass, r.Cause = StorageSyncConflict, FailureConflict, ErrConflict
 		return r
 	}
 	if choice == KeepRemote {
@@ -193,9 +208,22 @@ func (m *Mirror) Resolve(ctx context.Context, diary SessionDiary, choice Resolut
 	}
 	updated, err := m.Client.Put(ctx, m.Backend, m.Repository, r.Key, diary.Content, observedRevision)
 	if err != nil {
-		r.State, r.Cause = StorageSyncPending, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		if errors.Is(err, ErrPrerequisiteMissing) {
+			r.State, r.FailureClass, r.Cause = StoragePrerequisiteMissing, FailurePrerequisite, err
+			return r
+		}
+		r.State, r.FailureClass, r.Cause = StorageSyncPending, FailureTransient, fmt.Errorf("%w: %v", ErrUnavailable, err)
 		return r
 	}
-	r.State, r.RemoteID, r.RemoteRev = Mirrored, updated.ID, updated.Revision
+	r.State, r.RemoteID, r.RemoteURL, r.RemoteRev = Mirrored, updated.ID, updated.URL, updated.Revision
+	r.EffectiveRemoteHash = contentHash(updated.Content)
+	if r.EffectiveRemoteHash == contentHash("") {
+		r.EffectiveRemoteHash = r.LocalHash
+	}
 	return r
+}
+
+func contentHash(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
 }
