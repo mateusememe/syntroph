@@ -4,6 +4,17 @@ import "github.com/mateusememe/syntroph/core/storagecontract"
 
 func SafeStorageDiagnostic(value string) string { return storagecontract.SafeDiagnostic(value) }
 
+// StorageResultForJournal copies the provider result into its durable form.
+// Provider errors remain available through Cause while only bounded, redacted
+// diagnostics cross the append-only journal boundary.
+func StorageResultForJournal(result StorageResult) StorageResult {
+	if result.Error == "" && result.Cause != nil {
+		result.Error = result.Cause.Error()
+	}
+	result.Error = SafeStorageDiagnostic(result.Error)
+	return result
+}
+
 // StorageBackend identifies the remote representation while remaining
 // independent from any concrete transport.
 type StorageBackend = storagecontract.Backend
@@ -46,3 +57,18 @@ type StorageResult = storagecontract.Result
 // RemoteBinding is the current operational projection. The journal remains
 // the durable history from which it can be reconstructed.
 type RemoteBinding = storagecontract.Binding
+
+// StorageEventType is the Core-owned mapping from storage state to immutable
+// event type. CLI recovery paths use the same mapping as session close.
+func StorageEventType(state StorageState) string {
+	switch state {
+	case StorageMirrored:
+		return "storage.sync.succeeded"
+	case StorageSyncConflict:
+		return "storage.sync.conflict"
+	case StoragePrerequisiteMissing:
+		return "storage.prerequisite.missing"
+	default:
+		return "storage.sync.pending"
+	}
+}

@@ -61,6 +61,16 @@ func (s *BindingStore) Save(ctx context.Context, binding RemoteBinding) error {
 	return atomicWrite(path, data, 0o600)
 }
 
+// SaveResult persists the operational identity observed by a provider. It is
+// also used for provisional Issue bindings between create and close effects.
+func (s *BindingStore) SaveResult(ctx context.Context, provider string, result MirrorResult) error {
+	return s.Save(ctx, RemoteBinding{
+		IdempotencyKey: result.Key, Backend: result.Backend, Provider: provider,
+		RemoteID: result.RemoteID, URL: result.RemoteURL, RemoteRevision: RemoteRevision(result.RemoteRev),
+		LocalHash: result.LocalHash, EffectiveRemoteHash: result.EffectiveRemoteHash, UpdatedAt: time.Now().UTC(),
+	})
+}
+
 func (s *BindingStore) Load(ctx context.Context, key string) (RemoteBinding, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return RemoteBinding{}, false, err
@@ -387,12 +397,7 @@ func (m *ManagedMirror) run(ctx context.Context, diary SessionDiary, effect func
 			return result
 		}
 	}
-	binding := RemoteBinding{
-		IdempotencyKey: key, Backend: result.Backend, Provider: m.Provider,
-		RemoteID: result.RemoteID, URL: result.RemoteURL, RemoteRevision: RemoteRevision(result.RemoteRev),
-		LocalHash: result.LocalHash, EffectiveRemoteHash: result.EffectiveRemoteHash, UpdatedAt: time.Now().UTC(),
-	}
-	if err := m.Bindings.Save(ctx, binding); err != nil {
+	if err := m.Bindings.SaveResult(ctx, m.Provider, result); err != nil {
 		result.State, result.FailureClass, result.Cause = StorageSyncPending, FailureTransient, fmt.Errorf("persist remote binding: %w", err)
 	}
 	return result

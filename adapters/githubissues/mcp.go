@@ -75,10 +75,6 @@ func (o mcpIssueOperations) findMarked(ctx context.Context, key string) (issue, 
 func (o mcpIssueOperations) failed(r storage.MirrorResult, err error) storage.MirrorResult {
 	return o.provider.failed(r, err)
 }
-func (o mcpIssueOperations) failedWithRemote(r storage.MirrorResult, remote issue, err error) storage.MirrorResult {
-	return o.provider.failedWithRemote(r, remote, err)
-}
-
 func NewMCP(repository string, command []string, storageRoot string, opts MCPOptions) (*MCPProvider, error) {
 	parts := strings.Split(repository, "/")
 	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
@@ -242,16 +238,12 @@ func (p *MCPProvider) effectiveRemote(ctx context.Context, client *mcpClient, bi
 				return effectiveRemote{revision: commentRevision(correction), content: content, exact: false}, nil
 			}
 			marker, _ := parseCorrectionMarker(correction.Body, binding.IdempotencyKey)
-			remote, issueErr := p.getIssue(ctx, client, binding.RemoteID)
-			if issueErr != nil {
-				return effectiveRemote{}, issueErr
+			predecessor, matches, predecessorErr := p.predecessor(ctx, client, binding, comments, marker.Predecessor)
+			if predecessorErr != nil {
+				return effectiveRemote{}, predecessorErr
 			}
-			if revisionBodyHash(marker.Predecessor) != hash(remote.Body) {
-				remoteContent, markerExact := stripDiaryMarker(remote.Body, binding.IdempotencyKey)
-				if !markerExact {
-					remoteContent = remote.Body
-				}
-				return effectiveRemote{revision: issueRevision(remote), content: remoteContent, exact: markerExact}, nil
+			if !matches {
+				return predecessor, nil
 			}
 			return effectiveRemote{revision: commentRevision(correction), content: content, exact: exact}, nil
 		}
@@ -266,6 +258,40 @@ func (p *MCPProvider) effectiveRemote(ctx context.Context, client *mcpClient, bi
 		content = remote.Body
 	}
 	return effectiveRemote{revision: issueRevision(remote), content: content, exact: exact}, nil
+}
+
+func (p *MCPProvider) predecessor(ctx context.Context, client *mcpClient, binding storage.RemoteBinding, comments []comment, revision string) (effectiveRemote, bool, error) {
+	if strings.HasPrefix(revision, "issue:") {
+		remote, err := p.getIssue(ctx, client, binding.RemoteID)
+		if err != nil {
+			return effectiveRemote{}, false, err
+		}
+		content, exact := stripDiaryMarker(remote.Body, binding.IdempotencyKey)
+		if !exact {
+			content = remote.Body
+		}
+		actual := issueRevision(remote)
+		return effectiveRemote{revision: actual, content: content, exact: exact}, actual == revision, nil
+	}
+	if strings.HasPrefix(revision, "comment:") {
+		id, err := revisionID(revision, "comment")
+		if err != nil {
+			return effectiveRemote{}, false, err
+		}
+		for _, previous := range comments {
+			if strconv.FormatInt(previous.ID, 10) != id {
+				continue
+			}
+			content, exact := stripCorrectionMarker(previous.Body, binding.IdempotencyKey)
+			if !exact {
+				content = previous.Body
+			}
+			actual := commentRevision(previous)
+			return effectiveRemote{revision: actual, content: content, exact: exact}, actual == revision, nil
+		}
+		return effectiveRemote{}, false, errNotFound
+	}
+	return effectiveRemote{}, false, errors.New("correction predecessor has an unsupported remote revision")
 }
 
 func (p *MCPProvider) ensureLabels(ctx context.Context, client *mcpClient) error {
@@ -428,11 +454,6 @@ func (p *MCPProvider) failed(result storage.MirrorResult, err error) storage.Mir
 	}
 	result.FailureClass, result.Cause = class, err
 	return result
-}
-
-func (p *MCPProvider) failedWithRemote(result storage.MirrorResult, remote issue, err error) storage.MirrorResult {
-	result.RemoteID, result.RemoteURL = strconv.Itoa(remote.Number), remote.HTMLURL
-	return p.failed(result, err)
 }
 
 type mcpProviderError struct {

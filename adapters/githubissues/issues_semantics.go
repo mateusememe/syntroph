@@ -3,6 +3,7 @@ package githubissues
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -21,7 +22,6 @@ type issueOperations interface {
 	createCorrection(context.Context, int, storage.SessionDiary, string) (comment, error)
 	findMarked(context.Context, string) (issue, error)
 	failed(storage.MirrorResult, error) storage.MirrorResult
-	failedWithRemote(storage.MirrorResult, issue, error) storage.MirrorResult
 }
 
 type issueSemantics struct {
@@ -72,11 +72,20 @@ func (s issueSemantics) mirror(ctx context.Context, diary storage.SessionDiary, 
 		return s.ops.failed(r, err)
 	}
 	created := remote
+	provisional := observedIssue(r, created, diary.Content)
+	bindingErr := s.bindings.SaveResult(ctx, s.provider, provisional)
 	remote, err = s.ops.closeIssue(ctx, remote.Number)
 	if err != nil {
-		return s.ops.failedWithRemote(r, created, err)
+		if bindingErr != nil {
+			err = errors.Join(err, fmt.Errorf("persist provisional remote binding: %w", bindingErr))
+		}
+		return observedIssue(s.ops.failed(r, err), created, diary.Content)
 	}
-	return mirroredIssue(r, remote, diary.Content)
+	result := mirroredIssue(r, remote, diary.Content)
+	if bindingErr != nil {
+		return pending(result, fmt.Errorf("persist provisional remote binding: %w", bindingErr))
+	}
+	return result
 }
 
 func (s issueSemantics) status(ctx context.Context, diary storage.SessionDiary) storage.MirrorResult {
@@ -152,11 +161,17 @@ func (s issueSemantics) finishExisting(ctx context.Context, r storage.MirrorResu
 	if remote.State != "closed" || remote.StateReason != "completed" {
 		closed, err := s.ops.closeIssue(ctx, remote.Number)
 		if err != nil {
-			return s.ops.failedWithRemote(r, remote, err)
+			return observedIssue(s.ops.failed(r, err), remote, diary.Content)
 		}
 		return mirroredIssue(r, closed, diary.Content)
 	}
 	return compared
+}
+
+func observedIssue(r storage.MirrorResult, remote issue, content string) storage.MirrorResult {
+	r.RemoteID, r.RemoteURL, r.RemoteRev = strconv.Itoa(remote.Number), remote.HTMLURL, issueRevision(remote)
+	r.EffectiveRemoteHash = hash(content)
+	return r
 }
 
 func (s issueSemantics) compareEffective(ctx context.Context, r storage.MirrorResult, local string, binding storage.RemoteBinding) storage.MirrorResult {

@@ -75,6 +75,21 @@ func TestSessionCloseWritesImmutableDiaryAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestSessionCloseWithoutBusNeverPerformsUnjournaledRemoteEffect(t *testing.T) {
+	root := t.TempDir()
+	remote := &preflightStorage{ready: true}
+	diary, _, err := (SessionCloser{Memory: LocalMemoryStore{Root: filepath.Join(root, "memory")}, Storage: remote}).Close(context.Background(), SessionCloseRequest{
+		RepositoryID: "github.com/mateusememe/syntroph", CommitSHA: "no-journal", Author: "matt",
+		Format: ArtifactJSON, Artifact: []byte(`{"summary":"local only without journal"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diary.IdempotencyKey == "" || remote.mirrorCalls != 0 {
+		t.Fatalf("diary=%+v unjournaled mirror calls=%d", diary, remote.mirrorCalls)
+	}
+}
+
 func TestSessionCloseDifferentArtifactsAtSameCommitRemainDistinct(t *testing.T) {
 	store := LocalMemoryStore{Root: filepath.Join(t.TempDir(), "memory")}
 	closer := SessionCloser{Memory: store}
@@ -146,8 +161,15 @@ func TestSessionClosePersistsDiaryAndPrerequisiteBeforeSkippingMirror(t *testing
 		t.Fatalf("unexpected durable preflight sequence: %+v", records)
 	}
 	items, err := InspectRecovery(context.Background(), journal)
-	if err != nil || len(items) != 1 || items[0].State != "StoragePrerequisiteMissing" || items[0].NextAction != "syntroph doctor storage" {
-		t.Fatalf("unexpected recovery view: %+v err=%v", items, err)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("simultaneous graph and storage obligations were not preserved: %+v err=%v", items, err)
+	}
+	states := map[string]string{}
+	for _, item := range items {
+		states[item.State] = item.NextAction
+	}
+	if states["StoragePrerequisiteMissing"] != "syntroph doctor storage" || states[GraphResolutionPending] != "syntroph sync retry --graph" {
+		t.Fatalf("unexpected simultaneous recovery view: %+v", items)
 	}
 }
 
@@ -177,11 +199,18 @@ func TestCrashAfterRemoteEffectLeavesDurableStorageIntentPending(t *testing.T) {
 		t.Fatal("simulated remote effect did not execute")
 	}
 	items, err := InspectRecovery(context.Background(), journal)
-	if err != nil || len(items) != 1 || items[0].State != string(StorageSyncPending) || items[0].NextAction != "syntroph sync retry --storage" {
+	if err != nil || len(items) != 2 || !containsRecoveryState(items, string(StorageSyncPending)) || !containsRecoveryState(items, GraphResolutionPending) {
 		t.Fatalf("interrupted intent was not recoverable: items=%+v err=%v", items, err)
 	}
-	records, err := journal.ReadSaga(context.Background(), items[0].SagaID)
+	records, err := journal.ReadSaga(context.Background(), diarySagaID(items))
 	if err != nil || len(records) != 2 || records[1].Event == nil || records[1].Event.Type != "storage.sync.requested" {
 		t.Fatalf("intent was not durable before effect: records=%+v err=%v", records, err)
 	}
+}
+
+func diarySagaID(items []RecoveryItem) string {
+	if len(items) == 0 {
+		return ""
+	}
+	return items[0].SagaID
 }

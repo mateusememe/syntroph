@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -35,5 +36,21 @@ func TestSagaJournalRedactsAndBoundsProviderDiagnostics(t *testing.T) {
 	got := records[0].Attempt.Error
 	if strings.Contains(got, secret) || len(got) > 2070 || !strings.Contains(got, "[redacted]") || !strings.Contains(got, "[truncated]") {
 		t.Fatalf("unsafe diagnostic persisted: length=%d value=%q", len(got), got)
+	}
+}
+
+func TestStorageResultForJournalRedactsCauseAndStorageEventTypeIsCanonical(t *testing.T) {
+	secret := "journal-secret"
+	result := StorageResultForJournal(StorageResult{State: StorageSyncPending, Cause: errors.New("token=" + secret)})
+	if result.Error == "" || strings.Contains(result.Error, secret) || !strings.Contains(result.Error, "[redacted]") {
+		t.Fatalf("journal result error = %q", result.Error)
+	}
+	for state, want := range map[StorageState]string{
+		StorageMirrored: "storage.sync.succeeded", StorageSyncConflict: "storage.sync.conflict",
+		StoragePrerequisiteMissing: "storage.prerequisite.missing", StorageSyncPending: "storage.sync.pending",
+	} {
+		if got := StorageEventType(state); got != want {
+			t.Errorf("StorageEventType(%q) = %q, want %q", state, got, want)
+		}
 	}
 }

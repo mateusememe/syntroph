@@ -290,7 +290,7 @@ func TestSessionCloseInvalidStorageConfigKeepsLocalDiaryAndPerformsZeroProviderW
 		t.Fatal(err)
 	}
 	items, err := core.InspectRecovery(context.Background(), journal)
-	if err != nil || len(items) != 1 || items[0].State != "StoragePrerequisiteMissing" || items[0].Provider != "" {
+	if err != nil || len(items) != 2 || !hasStorageRecovery(items, "StoragePrerequisiteMissing", "") {
 		t.Fatalf("invalid configuration was not journaled safely: %+v err=%v", items, err)
 	}
 }
@@ -403,7 +403,7 @@ func TestWikiProviderWiresSessionCloseRetryAndResolveThroughConfiguredStorage(t 
 		t.Fatal(err)
 	}
 	items, err := core.InspectRecovery(context.Background(), journal)
-	if err != nil || len(items) != 1 || items[0].State != "StoragePrerequisiteMissing" {
+	if err != nil || len(items) != 2 || !hasStorageRecovery(items, "StoragePrerequisiteMissing", "github-wiki-git") {
 		t.Fatalf("missing Wiki recovery = %+v err=%v", items, err)
 	}
 
@@ -563,6 +563,42 @@ func TestStorageRetryReplaysPrerequisiteFailureAndJournalsBindingResult(t *testi
 	}
 }
 
+func TestStorageRetryPersistsRedactedDiagnosticInRecoveryView(t *testing.T) {
+	_, root := configuredTestRepository(t, "storage:\n  backend: issues\n  provider: github-rest\n")
+	t.Setenv("SYNTROPH_GITHUB_TOKEN", "injected-for-test")
+	secret := "retry-secret"
+	provider := &countingStorageProvider{mirrorResult: storage.MirrorResult{
+		State: storage.StorageSyncPending, Backend: storage.BackendIssues, Provider: "github-rest",
+		FailureClass: storage.FailureTransient, Cause: errors.New("token=" + secret + " remote unavailable"),
+	}}
+	previous := storageProviderBuilder
+	storageProviderBuilder = func(config.ResolvedStorage) storageadapter.Provider { return provider }
+	t.Cleanup(func() { storageProviderBuilder = previous })
+	diary := recoveryTestDiary("retry-redaction")
+	journal, err := core.NewSagaJournal(filepath.Join(root, "journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendSessionAndStorageResult(t, journal, diary, core.StorageResult{State: storage.StorageSyncPending, Backend: storage.BackendIssues, Provider: "github-rest", Key: diary.IdempotencyKey, FailureClass: storage.FailureTransient, Error: "previous failure"})
+
+	var out bytes.Buffer
+	if err := run([]string{"sync", "--journal=" + filepath.Join(root, "journal"), "retry", "--storage"}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	items, err := core.InspectRecovery(context.Background(), journal)
+	if err != nil || len(items) != 1 || !strings.Contains(items[0].LastError, "[redacted]") || strings.Contains(items[0].LastError, secret) {
+		t.Fatalf("unsafe or missing recovery diagnostic: items=%+v err=%v", items, err)
+	}
+	records, err := journal.ReadSaga(context.Background(), diary.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(records)
+	if bytes.Contains(encoded, []byte(secret)) {
+		t.Fatalf("journal leaked provider diagnostic: %s", encoded)
+	}
+}
+
 func TestStorageRetryUsesOneProviderLifecycleForAllSagasAndJournalsShutdownFailure(t *testing.T) {
 	_, root := configuredTestRepository(t, "storage:\n  backend: issues\n  provider: github-mcp\n  mcp:\n    command: [\"true\"]\n")
 	provider := &lifecycleStorageProvider{
@@ -572,7 +608,7 @@ func TestStorageRetryUsesOneProviderLifecycleForAllSagasAndJournalsShutdownFailu
 			RemoteRev: "issue:41:2026-08-31T12:00:00Z:" + strings.Repeat("b", 64),
 			LocalHash: strings.Repeat("a", 64), EffectiveRemoteHash: strings.Repeat("a", 64),
 		}},
-		endErr: errors.New("MCP process did not exit after stdin closed"),
+		endErr: errors.New("MCP process token=shutdown-secret did not exit after stdin closed"),
 	}
 	previous := storageProviderBuilder
 	storageProviderBuilder = func(config.ResolvedStorage) storageadapter.Provider { return provider }
@@ -598,7 +634,7 @@ func TestStorageRetryUsesOneProviderLifecycleForAllSagasAndJournalsShutdownFailu
 	if provider.beginCalls != 1 || provider.endCalls != 1 || provider.mirrorCalls != 2 {
 		t.Fatalf("lifecycle begin=%d end=%d mirrors=%d", provider.beginCalls, provider.endCalls, provider.mirrorCalls)
 	}
-	if !strings.Contains(out.String(), "shutdown failed") || !strings.Contains(out.String(), "2 saga(s)") {
+	if !strings.Contains(out.String(), "shutdown failed") || !strings.Contains(out.String(), "2 saga(s)") || strings.Contains(out.String(), "shutdown-secret") {
 		t.Fatalf("retry output omitted journaled shutdown failure: %s", out.String())
 	}
 	items, err := core.InspectRecovery(context.Background(), journal)
@@ -606,7 +642,7 @@ func TestStorageRetryUsesOneProviderLifecycleForAllSagasAndJournalsShutdownFailu
 		t.Fatalf("shutdown failure recovery items=%+v err=%v", items, err)
 	}
 	for _, item := range items {
-		if item.State != "StorageSyncPending" || item.FailureClass != "transient" || !strings.Contains(item.LastError, "did not exit") {
+		if item.State != "StorageSyncPending" || item.FailureClass != "transient" || !strings.Contains(item.LastError, "did not exit") || strings.Contains(item.LastError, "shutdown-secret") || !strings.Contains(item.LastError, "[redacted]") {
 			t.Fatalf("shutdown failure was not projected: %+v", item)
 		}
 	}
@@ -661,11 +697,60 @@ func TestConfiguredStorageResolveDisplaysPersistedDiffBeforeProviderEffect(t *te
 	}
 }
 
+func TestConfiguredStorageResolvePersistsRedactedFailure(t *testing.T) {
+	_, root := configuredTestRepository(t, "storage:\n  backend: issues\n  provider: github-rest\n")
+	t.Setenv("SYNTROPH_GITHUB_TOKEN", "injected-for-test")
+	secret := "resolve-secret"
+	provider := &countingStorageProvider{resolutionResult: storage.MirrorResult{
+		State: storage.StorageSyncPending, Backend: storage.BackendIssues, Provider: "github-rest",
+		FailureClass: storage.FailureTransient, Cause: errors.New("password=" + secret + " unavailable"),
+	}}
+	previous := storageProviderBuilder
+	storageProviderBuilder = func(config.ResolvedStorage) storageadapter.Provider { return provider }
+	t.Cleanup(func() { storageProviderBuilder = previous })
+	diary := recoveryTestDiary("resolve-redaction")
+	journal, err := core.NewSagaJournal(filepath.Join(root, "journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := filepath.Join(root, "storage", "conflicts", diary.IdempotencyKey, "issue.remote.md")
+	if err := os.MkdirAll(filepath.Dir(snapshot), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapshot, []byte("human remote edit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	revision := "issue:42:2026-08-31T12:00:00Z:" + strings.Repeat("c", 64)
+	appendSessionAndStorageResult(t, journal, diary, core.StorageResult{State: storage.StorageSyncConflict, Backend: storage.BackendIssues, Provider: "github-rest", Key: diary.IdempotencyKey, RemoteID: "42", RemoteURL: "https://github.test/issues/42", RemoteRev: revision, FailureClass: storage.FailureConflict, ConflictSnapshot: snapshot, Error: "remote diverged"})
+
+	var out bytes.Buffer
+	err = run([]string{"sync", "--journal=" + filepath.Join(root, "journal"), "resolve", diary.SessionID, "--keep-local", "--root", root}, &out, os.Stderr)
+	if err == nil || strings.Contains(err.Error(), secret) || !strings.Contains(err.Error(), "[redacted]") {
+		t.Fatalf("resolve error was not safely surfaced: %v", err)
+	}
+	items, inspectErr := core.InspectRecovery(context.Background(), journal)
+	if inspectErr != nil || len(items) != 1 {
+		t.Fatalf("resolve recovery diagnostic: items=%+v err=%v", items, inspectErr)
+	}
+	if strings.Contains(items[0].LastError, secret) || !strings.Contains(items[0].LastError, "[redacted]") {
+		t.Fatalf("resolve recovery error = %q", items[0].LastError)
+	}
+}
+
 func recoveryTestDiary(sessionID string) core.SessionDiary {
 	return core.SessionDiary{
 		SessionID: sessionID, IdempotencyKey: strings.Repeat("e", 64), RepositoryID: "github.com/mateusememe/syntroph",
 		CommitSHA: "abc123", ArtifactHash: strings.Repeat("f", 64), Author: "matt", CreatedAt: time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC), Title: "Session diary", Summary: "durable local knowledge",
 	}
+}
+
+func hasStorageRecovery(items []core.RecoveryItem, state, provider string) bool {
+	for _, item := range items {
+		if item.State == state && item.Provider == provider {
+			return true
+		}
+	}
+	return false
 }
 
 func appendSessionAndStorageResult(t *testing.T, journal *core.SagaJournal, diary core.SessionDiary, result core.StorageResult) {
@@ -675,7 +760,7 @@ func appendSessionAndStorageResult(t *testing.T, journal *core.SagaJournal, diar
 		t.Fatal(err)
 	}
 	payload, _ = json.Marshal(result)
-	if err := journal.AppendEvent(context.Background(), core.Event{EventID: diary.SessionID + ":storage", Type: storageResultEventType(string(result.State)), OccurredAt: diary.CreatedAt, RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: diary.SessionID, SchemaVersion: 1, Payload: payload}); err != nil {
+	if err := journal.AppendEvent(context.Background(), core.Event{EventID: diary.SessionID + ":storage", Type: core.StorageEventType(result.State), OccurredAt: diary.CreatedAt, RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: diary.SessionID, SchemaVersion: 1, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
 }

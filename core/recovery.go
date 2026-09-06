@@ -92,34 +92,57 @@ func InspectRecovery(ctx context.Context, journal *SagaJournal) ([]RecoveryItem,
 		}
 
 		if storageResult != nil && !storageResolved {
-			applyStorageRecovery(&item, *storageResult)
-		} else {
-			handlerPending := false
-			seenHandlers := make(map[string]bool)
-			for i := len(item.Attempts) - 1; i >= 0; i-- {
-				attempt := item.Attempts[i]
-				if seenHandlers[attempt.HandlerID] {
-					continue
-				}
-				seenHandlers[attempt.HandlerID] = true
-				if attempt.HandlerID != "storage-mirror" && attempt.Outcome == "failed" {
-					item.State = "HandlerPending"
-					item.LastError = attempt.Error
-					item.NextAction = "syntroph sync retry"
-					handlerPending = true
-					break
-				}
+			storageItem := item
+			applyStorageRecovery(&storageItem, *storageResult)
+			if diagnostic := latestFailedStorageDiagnostic(item.Attempts); diagnostic != "" {
+				storageItem.LastError = SafeStorageDiagnostic(diagnostic)
 			}
-			if !handlerPending && graphState != "" {
-				item.State, item.NextAction = graphState, "syntroph sync retry --graph"
-			}
+			items = append(items, storageItem)
 		}
-		if item.State != "Succeeded" {
-			items = append(items, item)
+
+		seenHandlers := make(map[string]bool)
+		for i := len(item.Attempts) - 1; i >= 0; i-- {
+			attempt := item.Attempts[i]
+			if seenHandlers[attempt.HandlerID] {
+				continue
+			}
+			seenHandlers[attempt.HandlerID] = true
+			if isStorageHandler(attempt.HandlerID) || attempt.Outcome != "failed" {
+				continue
+			}
+			handlerItem := item
+			handlerItem.State = "HandlerPending"
+			handlerItem.LastError = attempt.Error
+			handlerItem.NextAction = "syntroph sync retry"
+			items = append(items, handlerItem)
+			break
+		}
+		if graphState != "" {
+			graphItem := item
+			graphItem.State, graphItem.NextAction = graphState, "syntroph sync retry --graph"
+			items = append(items, graphItem)
 		}
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].SagaID < items[j].SagaID })
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].SagaID == items[j].SagaID {
+			return items[i].State < items[j].State
+		}
+		return items[i].SagaID < items[j].SagaID
+	})
 	return items, nil
+}
+
+func isStorageHandler(handlerID string) bool {
+	return handlerID == "storage-mirror" || handlerID == "storage-retry" || handlerID == "storage-resolve" || handlerID == "storage-shutdown"
+}
+
+func latestFailedStorageDiagnostic(attempts []HandlerAttempt) string {
+	for i := len(attempts) - 1; i >= 0; i-- {
+		if isStorageHandler(attempts[i].HandlerID) && attempts[i].Outcome == "failed" && attempts[i].Error != "" {
+			return attempts[i].Error
+		}
+	}
+	return ""
 }
 
 func applyStorageRecovery(item *RecoveryItem, result StorageResult) {
@@ -128,7 +151,7 @@ func applyStorageRecovery(item *RecoveryItem, result StorageResult) {
 	item.Backend, item.Provider = string(result.Backend), result.Provider
 	item.RemoteID, item.RemoteURL, item.RemoteRevision = result.RemoteID, result.RemoteURL, result.RemoteRev
 	item.FailureClass, item.ConflictSnapshot = string(result.FailureClass), result.ConflictSnapshot
-	item.LastError = firstNonEmpty(result.Error, errorString(result.Cause))
+	item.LastError = SafeStorageDiagnostic(firstNonEmpty(result.Error, errorString(result.Cause)))
 	switch result.State {
 	case "StorageSyncConflict":
 		item.NextAction = fmt.Sprintf("syntroph sync resolve %s --keep-local|--keep-remote", item.SagaID)

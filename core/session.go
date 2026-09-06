@@ -285,15 +285,8 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 	payload, _ := json.Marshal(diary)
 	e := Event{EventID: diary.SessionID, Type: "session.closed", OccurredAt: now, RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, SchemaVersion: 1, Payload: payload}
 	if c.Bus == nil {
-		if c.Storage != nil {
-			ready := true
-			if preflight, ok := c.Storage.(StoragePreflightPort); ok {
-				ready = preflight.Preflight(ctx).Ready
-			}
-			if ready {
-				_ = c.Storage.Mirror(ctx, diary)
-			}
-		}
+		// Remote effects require a durable intent and outcome. Without an Event
+		// Bus backed by the Saga Journal, the local diary is the only safe effect.
 		return diary, Delivery{EventID: diary.SessionID}, nil
 	}
 	delivery, err := c.Bus.Publish(ctx, e)
@@ -338,10 +331,7 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 			storageResult.EventID = storageEventID
 		}
 	}
-	if storageResult.Cause != nil && storageResult.Error == "" {
-		storageResult.Error = SafeStorageDiagnostic(storageResult.Cause.Error())
-	}
-	storageResult.Error = SafeStorageDiagnostic(storageResult.Error)
+	storageResult = StorageResultForJournal(storageResult)
 	if journal, ok := c.Bus.journal.(*SagaJournal); ok {
 		attempt := HandlerAttempt{EventID: storageEventID, SagaID: diary.SessionID, HandlerID: "storage-mirror", AttemptedAt: time.Now().UTC(), Outcome: "succeeded"}
 		if storageResult.State != "mirrored" {
@@ -357,26 +347,13 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 		// A concurrent attempt is diagnostic, not another pending obligation.
 		if !storageResult.AlreadyInProgress {
 			outcomePayload, _ := json.Marshal(storageResult)
-			storageEvent := Event{EventID: storageEventID + ":outcome", Type: storageEventType(string(storageResult.State)), OccurredAt: time.Now().UTC(), RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: storageEventID, SchemaVersion: 1, Payload: outcomePayload}
+			storageEvent := Event{EventID: storageEventID + ":outcome", Type: StorageEventType(storageResult.State), OccurredAt: time.Now().UTC(), RepositoryID: diary.RepositoryID, SagaID: diary.SessionID, CorrelationID: diary.SessionID, CausationID: storageEventID, SchemaVersion: 1, Payload: outcomePayload}
 			if appendErr := journal.AppendEvent(ctx, storageEvent); appendErr != nil {
 				return diary, delivery, appendErr
 			}
 		}
 	}
 	return diary, delivery, err
-}
-
-func storageEventType(state string) string {
-	switch state {
-	case "mirrored":
-		return "storage.sync.succeeded"
-	case "StorageSyncConflict":
-		return "storage.sync.conflict"
-	case "StoragePrerequisiteMissing":
-		return "storage.prerequisite.missing"
-	default:
-		return "storage.sync.pending"
-	}
 }
 
 func unresolvedReferences(refs []CodeReference, repositoryID, commitSHA string) []CodeReference {

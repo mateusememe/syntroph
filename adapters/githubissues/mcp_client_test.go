@@ -170,6 +170,40 @@ func TestMCPProviderMirrorsWithCanonicalOrderingAndRecoversLostBinding(t *testin
 	}
 }
 
+func TestMCPProviderPersistsCreatedIssueBeforeRetryingClosure(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "storage")
+	statePath := filepath.Join(t.TempDir(), "remote.json")
+	logPath := filepath.Join(t.TempDir(), "calls.log")
+	t.Setenv("GO_WANT_MCP_HELPER", "provider-close-fails")
+	t.Setenv("MCP_HELPER_STATE", statePath)
+	t.Setenv("MCP_HELPER_LOG", logPath)
+	remote, err := NewMCP("mateusememe/syntroph", helperCommand(), root, MCPOptions{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed, err := storage.NewManagedMirror(root, MCPProviderID, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := managed.Mirror(context.Background(), testDiary())
+	if first.State != storage.StorageSyncPending || first.RemoteID != "42" {
+		t.Fatalf("initial close failure = %+v", first)
+	}
+	binding, ok, err := managed.Bindings.Load(context.Background(), testDiary().Key())
+	if err != nil || !ok || binding.RemoteID != "42" || !strings.HasPrefix(string(binding.RemoteRevision), "issue:42:") {
+		t.Fatalf("provisional binding=%+v ok=%v err=%v", binding, ok, err)
+	}
+	second := managed.Recover(context.Background(), testDiary())
+	if second.State != storage.Mirrored || readHelperState().Issue.State != "closed" {
+		t.Fatalf("recovered closure = %+v state=%+v", second, readHelperState())
+	}
+	logData, _ := os.ReadFile(logPath)
+	if strings.Count(string(logData), "issue_write:create") != 1 || strings.Contains(string(logData), "list_issues") {
+		t.Fatalf("retry duplicated or searched instead of using binding:\n%s", logData)
+	}
+}
+
 func TestMCPProviderReusesOneNegotiatedProcessForACommand(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "storage")
 	logPath := filepath.Join(t.TempDir(), "calls.log")
@@ -339,6 +373,33 @@ func TestMCPProviderConflictUsesAppendOnlyCorrectionAndTypedBinding(t *testing.T
 	}
 }
 
+func TestMCPProviderValidatesChainedCorrectionPredecessor(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "storage")
+	t.Setenv("GO_WANT_MCP_HELPER", "provider")
+	t.Setenv("MCP_HELPER_STATE", filepath.Join(t.TempDir(), "remote.json"))
+	diary := testDiary()
+	remoteIssue := issue{Number: 42, HTMLURL: "https://github.test/issues/42", Body: "human edit", UpdatedAt: mustTime("2026-08-31T12:00:00Z"), State: "closed", StateReason: "completed"}
+	first := comment{ID: 77, Body: correctionBody("first correction", diary.Key(), issueRevision(remoteIssue)), UpdatedAt: mustTime("2026-08-31T12:01:00Z")}
+	second := comment{ID: 78, Body: correctionBody(diary.Content, diary.Key(), commentRevision(first)), UpdatedAt: mustTime("2026-08-31T12:02:00Z")}
+	writeHelperState(helperRemoteState{Issue: remoteIssue, Comments: []comment{first, second}})
+	remote, _ := NewMCP("mateusememe/syntroph", helperCommand(), root, MCPOptions{Timeout: time.Second})
+	managed, _ := storage.NewManagedMirror(root, MCPProviderID, remote)
+	binding := storage.RemoteBinding{IdempotencyKey: diary.Key(), Backend: storage.BackendIssues, Provider: MCPProviderID, RemoteID: "42", URL: remoteIssue.HTMLURL, RemoteRevision: storage.RemoteRevision(commentRevision(second)), LocalHash: hash(diary.Content), EffectiveRemoteHash: hash(diary.Content), UpdatedAt: time.Now().UTC()}
+	if err := managed.Bindings.Save(context.Background(), binding); err != nil {
+		t.Fatal(err)
+	}
+	if result := managed.Status(context.Background(), diary); result.State != storage.Mirrored {
+		t.Fatalf("valid correction chain = %+v", result)
+	}
+	state := readHelperState()
+	state.Comments[0].Body = "human changed predecessor"
+	state.Comments[0].UpdatedAt = mustTime("2026-08-31T12:03:00Z")
+	writeHelperState(state)
+	if result := managed.Status(context.Background(), diary); result.State != storage.StorageSyncConflict || result.RemoteRev != commentRevision(state.Comments[0]) {
+		t.Fatalf("changed correction predecessor = %+v", result)
+	}
+}
+
 func helperCommand() []string {
 	return []string{os.Args[0], "-test.run=^TestMCPHelperProcess$"}
 }
@@ -456,9 +517,10 @@ func TestMCPHelperProcess(t *testing.T) {
 }
 
 type helperRemoteState struct {
-	Labels   map[string]label `json:"labels"`
-	Issue    issue            `json:"issue"`
-	Comments []comment        `json:"comments"`
+	Labels        map[string]label `json:"labels"`
+	Issue         issue            `json:"issue"`
+	Comments      []comment        `json:"comments"`
+	CloseAttempts int              `json:"close_attempts,omitempty"`
 }
 
 func providerToolCall(params map[string]any) map[string]any {
@@ -512,6 +574,11 @@ func providerToolCall(params map[string]any) map[string]any {
 		if method == "create" {
 			state.Issue = issue{Number: 42, HTMLURL: "https://github.test/issues/42", Body: stringArg(arguments, "body"), UpdatedAt: mustTime("2026-08-31T12:00:00Z"), State: "open"}
 		} else {
+			state.CloseAttempts++
+			if os.Getenv("GO_WANT_MCP_HELPER") == "provider-close-fails" && state.CloseAttempts == 1 {
+				writeHelperState(state)
+				return map[string]any{"isError": true, "content": []map[string]any{{"type": "text", "text": "temporarily unavailable"}}}
+			}
 			state.Issue.State, state.Issue.StateReason = "closed", "completed"
 			state.Issue.UpdatedAt = mustTime("2026-08-31T12:01:00Z")
 		}

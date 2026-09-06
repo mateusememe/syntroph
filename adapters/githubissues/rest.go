@@ -187,16 +187,12 @@ func (p *Provider) effectiveRemote(ctx context.Context, binding storage.RemoteBi
 			return effectiveRemote{revision: commentRevision(correction), content: content, exact: false}, nil
 		}
 		marker, _ := parseCorrectionMarker(correction.Body, binding.IdempotencyKey)
-		remote, issueErr := p.getIssue(ctx, binding.RemoteID)
-		if issueErr != nil {
-			return effectiveRemote{}, issueErr
+		predecessor, matches, predecessorErr := p.predecessor(ctx, binding, marker.Predecessor)
+		if predecessorErr != nil {
+			return effectiveRemote{}, predecessorErr
 		}
-		if revisionBodyHash(marker.Predecessor) != hash(remote.Body) {
-			remoteContent, markerExact := stripDiaryMarker(remote.Body, binding.IdempotencyKey)
-			if !markerExact {
-				remoteContent = remote.Body
-			}
-			return effectiveRemote{revision: issueRevision(remote), content: remoteContent, exact: markerExact}, nil
+		if !matches {
+			return predecessor, nil
 		}
 		return effectiveRemote{revision: commentRevision(correction), content: content, exact: exact}, nil
 	}
@@ -209,6 +205,38 @@ func (p *Provider) effectiveRemote(ctx context.Context, binding storage.RemoteBi
 		content = remote.Body
 	}
 	return effectiveRemote{revision: issueRevision(remote), content: content, exact: exact}, nil
+}
+
+func (p *Provider) predecessor(ctx context.Context, binding storage.RemoteBinding, revision string) (effectiveRemote, bool, error) {
+	if strings.HasPrefix(revision, "issue:") {
+		remote, err := p.getIssue(ctx, binding.RemoteID)
+		if err != nil {
+			return effectiveRemote{}, false, err
+		}
+		content, exact := stripDiaryMarker(remote.Body, binding.IdempotencyKey)
+		if !exact {
+			content = remote.Body
+		}
+		actual := issueRevision(remote)
+		return effectiveRemote{revision: actual, content: content, exact: exact}, actual == revision, nil
+	}
+	if strings.HasPrefix(revision, "comment:") {
+		id, err := revisionID(revision, "comment")
+		if err != nil {
+			return effectiveRemote{}, false, err
+		}
+		previous, err := p.getComment(ctx, id)
+		if err != nil {
+			return effectiveRemote{}, false, err
+		}
+		content, exact := stripCorrectionMarker(previous.Body, binding.IdempotencyKey)
+		if !exact {
+			content = previous.Body
+		}
+		actual := commentRevision(previous)
+		return effectiveRemote{revision: actual, content: content, exact: exact}, actual == revision, nil
+	}
+	return effectiveRemote{}, false, errors.New("correction predecessor has an unsupported remote revision")
 }
 
 func revisionID(revision, kind string) (string, error) {
@@ -277,11 +305,6 @@ func (p *Provider) failed(r storage.MirrorResult, err error) storage.MirrorResul
 	r.Cause = err
 	return r
 }
-func (p *Provider) failedWithRemote(r storage.MirrorResult, i issue, err error) storage.MirrorResult {
-	r.RemoteID, r.RemoteURL = strconv.Itoa(i.Number), i.HTMLURL
-	return p.failed(r, err)
-}
-
 func (p *Provider) ensureLabels(ctx context.Context) error {
 	for _, want := range reservedLabels {
 		var got label
@@ -580,12 +603,6 @@ func parseCorrectionMarker(body, key string) (correctionMarker, bool) {
 	return correctionMarker{Content: content, LocalHash: localHash, Predecessor: predecessor}, true
 }
 
-func revisionBodyHash(revision string) string {
-	if i := strings.LastIndexByte(revision, ':'); i >= 0 {
-		return revision[i+1:]
-	}
-	return ""
-}
 func hash(content string) string {
 	sum := sha256.Sum256([]byte(content))
 	return hex.EncodeToString(sum[:])
