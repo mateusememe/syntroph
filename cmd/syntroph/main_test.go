@@ -95,6 +95,78 @@ func TestSyncRetryRequiresExactlyOneScope(t *testing.T) {
 	}
 }
 
+func TestSkillSyncListAndShowUseRepositoryCatalog(t *testing.T) {
+	repositoryRoot := t.TempDir()
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "config.yaml"), `skills:
+  enabled: true
+  runtime_lock: .syntroph/skills.runtime.lock.yaml
+  sources:
+    - id: source
+      path: skills
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "skills.runtime.lock.yaml"), `schema_version: 1
+packages:
+  - source_id: source
+    name: review
+    directory: review
+    description: Review repository changes
+    license: MIT
+    source_url: https://example.test/skills
+    source_revision: revision-1
+    instructions: SKILL.md
+    files: [SKILL.md]
+    compatible_runtimes: [codex]
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, "skills", "review", "SKILL.md"), "# Review\n")
+
+	var out bytes.Buffer
+	if err := run([]string{"skill", "sync", "--root", repositoryRoot}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"state": "Ready"`, `"source_id": "source"`, `"name": "review"`} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("skill sync output missing %q: %s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), `"instructions":`) || strings.Contains(out.String(), "# Review") {
+		t.Fatalf("skill sync exposed full package content instead of its summary: %s", out.String())
+	}
+
+	out.Reset()
+	if err := run([]string{"skill", "list", "--root", repositoryRoot}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"package_hash"`) || !strings.Contains(out.String(), `"Ready"`) {
+		t.Fatalf("skill list output lacks catalog identity and state: %s", out.String())
+	}
+	if strings.Contains(out.String(), `"instructions"`) || strings.Contains(out.String(), "# Review") {
+		t.Fatalf("skill list exposed full package content instead of its summary: %s", out.String())
+	}
+
+	out.Reset()
+	if err := run([]string{"skill", "show", "source/review", "--root", repositoryRoot}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"license": "MIT"`, `"source_revision": "revision-1"`, `"instructions_path": "SKILL.md"`} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("skill show output missing %q: %s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), `"instructions":`) || strings.Contains(out.String(), "# Review") {
+		t.Fatalf("skill show exposed instruction content instead of auditable metadata: %s", out.String())
+	}
+}
+
+func writeSkillCLIFile(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSyncResolveShowsDiffAndRequiresExplicitChoice(t *testing.T) {
 	dir := t.TempDir()
 	local, remote := filepath.Join(dir, "local"), filepath.Join(dir, "remote")

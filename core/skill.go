@@ -44,8 +44,13 @@ type SkillPackage struct {
 	SchemaVersion      int                  `json:"schema_version"`
 	Identity           SkillPackageIdentity `json:"identity"`
 	Description        string               `json:"description"`
+	License            string               `json:"license"`
+	SourceURL          string               `json:"source_url"`
+	SourceRevision     string               `json:"source_revision"`
+	InstructionsPath   string               `json:"instructions_path"`
 	Instructions       string               `json:"instructions"`
 	Assets             []SkillAsset         `json:"assets,omitempty"`
+	ArgumentsSchema    map[string]any       `json:"arguments_schema,omitempty"`
 	CompatibleRuntimes []string             `json:"compatible_runtimes,omitempty"`
 }
 
@@ -294,6 +299,7 @@ func validateSkillCatalogEntry(entry SkillCatalogEntry) error {
 
 func cloneSkillCatalogEntry(entry SkillCatalogEntry) SkillCatalogEntry {
 	entry.Package.Assets = append([]SkillAsset(nil), entry.Package.Assets...)
+	entry.Package.ArgumentsSchema = cloneSkillArguments(entry.Package.ArgumentsSchema)
 	entry.Package.CompatibleRuntimes = append([]string(nil), entry.Package.CompatibleRuntimes...)
 	return entry
 }

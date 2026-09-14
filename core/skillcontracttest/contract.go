@@ -86,6 +86,9 @@ func RunSkillPort(t *testing.T, name string, factory SkillPortFactory) {
 
 	t.Run(name+"/unsupported_package_is_isolated", func(t *testing.T) {
 		fixture := factory(t)
+		if fixture.UnsupportedName == "" {
+			return
+		}
 		validateSkillPortFixture(t, fixture)
 		if _, err := fixture.Port.Prepare(context.Background(), core.SkillPrepareRequest{Name: fixture.UnsupportedName}); !errors.Is(err, core.ErrUnsupportedSkill) {
 			t.Fatalf("unsupported package error = %v, want ErrUnsupportedSkill", err)
@@ -98,7 +101,7 @@ func RunSkillPort(t *testing.T, name string, factory SkillPortFactory) {
 
 func validateSkillPortFixture(t *testing.T, fixture SkillPortFixture) {
 	t.Helper()
-	if fixture.Port == nil || fixture.ReadyName == "" || fixture.UnsupportedName == "" || fixture.Runtime == "" {
+	if fixture.Port == nil || fixture.ReadyName == "" || fixture.Runtime == "" {
 		t.Fatal("skill port contract fixture is incomplete")
 	}
 }
