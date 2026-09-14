@@ -1,0 +1,3 @@
+# Skill catalogs are offline and repository-scoped
+
+Each Repository Installation owns a versioned runtime skill lock and a content-addressed local Skill Catalog reconstructed only by an explicit synchronization command from declared filesystem sources. Preparation never downloads, updates, executes, or silently overrides a package; packages containing executable content, symlinks, escaping paths, undeclared files, or missing provenance remain visible as Unsupported Skill Packages. This separates the product catalog from Syntroph's own development skills, makes preparation reproducible and offline, and defers executable assets until SandboxPort can enforce an explicit policy.

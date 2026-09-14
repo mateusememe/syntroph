@@ -13,6 +13,32 @@ _Avoid_: session diary, source memory
 **Related Link**: An explicit link between memories that preserves provenance across diaries and projections.
 _Avoid_: implicit context, orphan reference
 
+## Skills
+
+**Skill Package**: Authored skill instructions and their explicitly declared supporting files before Syntroph validates and normalizes them.
+_Avoid_: skill bundle, arbitrary directory, executable plugin
+
+**Skill Bundle**: An immutable, validated, runtime-neutral representation of one Skill Package that a runtime can interpret.
+_Avoid_: prompt execution, runtime installation, mutable skill
+
+**Skill Catalog**: The repository-scoped collection of skill identities and validation states selected for a Repository Installation.
+_Avoid_: global skill registry, runtime-owned skill directory
+
+**Skill Source**: A declared local origin from which Skill Packages may be synchronized into a Skill Catalog.
+_Avoid_: implicit search path, automatic downloader
+
+**Unsupported Skill Package**: A visible catalog entry that failed integrity, safety, licensing, or compatibility validation and cannot be prepared as a Skill Bundle.
+_Avoid_: partially trusted skill, silently skipped package
+
+**Skill Invocation**: One intentional use of a Skill Bundle, identified independently from technical redelivery or another use of the same bundle.
+_Avoid_: event ID, bundle hash, session
+
+**Skill Invocation Record**: A portable snapshot of a Skill Invocation's bundle identity, runtime, inputs, outcome, artifacts, and provenance.
+_Avoid_: transcript, flattened diary content, mutable execution log
+
+**Skill Provenance**: The evidence level of a Skill Invocation Record: journal-verified when it matches local journal evidence, or runtime-declared when supplied without that evidence.
+_Avoid_: trust score, inferred execution
+
 ## Synchronization
 
 **Graph Sync Pending**: A state in which the diary is persisted but graph enrichment or push has not completed and can be safely resumed.
