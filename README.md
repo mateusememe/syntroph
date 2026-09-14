@@ -33,9 +33,15 @@ syntroph sync status
 syntroph sync recovery
 syntroph sync retry --graph
 syntroph sync resolve <id> --keep-local
+syntroph skill sync
+syntroph skill list
+syntroph skill show <source/name>
+syntroph skill recovery
 ```
 
 Session artifacts are structured Markdown or JSON. A manual `--summary` fallback is supported; raw transcript capture is outside the MVP.
+
+Skill Catalog synchronization is explicit, offline, and installation-scoped. It keeps immutable package objects under `.syntroph/catalog/store/` and atomically publishes only a completely verified index. A concurrent writer reports `in_progress`; an interrupted writer requires inspection with `syntroph skill recovery` and explicit cleanup with `syntroph skill recovery --clear-orphan`. Cleanup first verifies that the recorded process is dead and never deletes historical package objects.
 
 Repository configuration uses `.syntroph/config.yaml` exclusively. Run `syntroph doctor storage` after cloning to validate the selected provider, normalized destination, and local prerequisites without authenticating or writing remotely. See [Installation](INSTALL.md#github-mirroring) for safe examples.
 

@@ -15,6 +15,7 @@ import (
 
 	"github.com/mateusememe/syntroph/adapters/githubissues"
 	"github.com/mateusememe/syntroph/adapters/githubwiki"
+	"github.com/mateusememe/syntroph/adapters/skillfilesystem"
 	"github.com/mateusememe/syntroph/adapters/storageadapter"
 	"github.com/mateusememe/syntroph/config"
 	"github.com/mateusememe/syntroph/core"
@@ -155,6 +156,75 @@ packages:
 	if strings.Contains(out.String(), `"instructions":`) || strings.Contains(out.String(), "# Review") {
 		t.Fatalf("skill show exposed instruction content instead of auditable metadata: %s", out.String())
 	}
+}
+
+func TestSkillRecoveryInspectsStateAndRefusesToClearLiveOwner(t *testing.T) {
+	repositoryRoot := skillRecoveryCLIRepository(t)
+	owner := fmt.Sprintf(`{"schema_version":1,"pid":%d,"started_at":"2026-09-14T12:00:00Z","owner_id":"live-owner"}`, os.Getpid())
+	lockPath := filepath.Join(repositoryRoot, ".syntroph", "catalog", "sync.lock")
+	writeSkillCLIFile(t, lockPath, owner)
+	stagingPath := filepath.Join(repositoryRoot, ".syntroph", "catalog", "staging", "live-owner")
+	writeSkillCLIFile(t, filepath.Join(stagingPath, "owner.json"), owner)
+
+	var out bytes.Buffer
+	if err := run([]string{"skill", "recovery", "--root", repositoryRoot}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"state": "in_progress"`) || !strings.Contains(out.String(), `"owner_id": "live-owner"`) {
+		t.Fatalf("skill recovery output = %s", out.String())
+	}
+	out.Reset()
+	if err := run([]string{"skill", "recovery", "--clear-orphan", "--root", repositoryRoot}, &out, os.Stderr); !errors.Is(err, skillfilesystem.ErrSyncStillRunning) {
+		t.Fatalf("clear live recovery error = %v", err)
+	}
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("live lock was removed: %v", err)
+	}
+	if _, err := os.Stat(stagingPath); err != nil {
+		t.Fatalf("live staging was removed: %v", err)
+	}
+}
+
+func TestSkillRecoveryExplicitlyClearsDeadOwner(t *testing.T) {
+	process := exec.Command(os.Args[0], "-test.run=^$")
+	if err := process.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadPID := process.Process.Pid
+	if err := process.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	repositoryRoot := skillRecoveryCLIRepository(t)
+	owner := fmt.Sprintf(`{"schema_version":1,"pid":%d,"started_at":"2026-09-14T12:00:00Z","owner_id":"dead-owner"}`, deadPID)
+	lockPath := filepath.Join(repositoryRoot, ".syntroph", "catalog", "sync.lock")
+	writeSkillCLIFile(t, lockPath, owner)
+	stagingPath := filepath.Join(repositoryRoot, ".syntroph", "catalog", "staging", "dead-owner")
+	writeSkillCLIFile(t, filepath.Join(stagingPath, "owner.json"), owner)
+
+	var out bytes.Buffer
+	if err := run([]string{"skill", "recovery", "--clear-orphan", "--root", repositoryRoot}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"state": "none"`) {
+		t.Fatalf("skill recovery output = %s", out.String())
+	}
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("dead lock remains: %v", err)
+	}
+	if _, err := os.Stat(stagingPath); !os.IsNotExist(err) {
+		t.Fatalf("dead staging remains: %v", err)
+	}
+}
+
+func skillRecoveryCLIRepository(t *testing.T) string {
+	t.Helper()
+	repositoryRoot := t.TempDir()
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "config.yaml"), `skills:
+  enabled: true
+  runtime_lock: .syntroph/skills.runtime.lock.yaml
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "skills.runtime.lock.yaml"), "schema_version: 1\npackages: []\n")
+	return repositoryRoot
 }
 
 func writeSkillCLIFile(t *testing.T, path, contents string) {

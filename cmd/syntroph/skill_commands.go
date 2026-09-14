@@ -35,7 +35,7 @@ type skillPackageMetadata struct {
 
 func runSkill(args []string, out, errOut interface{ Write([]byte) (int, error) }) error {
 	if len(args) == 0 {
-		return errors.New("usage: syntroph skill <sync|list|show> [--root repository]")
+		return errors.New("usage: syntroph skill <sync|list|show|recovery> [--root repository]")
 	}
 	command := args[0]
 	commandArgs := args[1:]
@@ -45,6 +45,10 @@ func runSkill(args []string, out, errOut interface{ Write([]byte) (int, error) }
 	flags := flag.NewFlagSet("skill "+command, flag.ContinueOnError)
 	flags.SetOutput(errOut)
 	repositoryRoot := flags.String("root", ".", "Repository Installation root")
+	var clearOrphan *bool
+	if command == "recovery" {
+		clearOrphan = flags.Bool("clear-orphan", false, "clear synchronization state after process-liveness verification")
+	}
 	if err := flags.Parse(commandArgs); err != nil {
 		return err
 	}
@@ -55,7 +59,7 @@ func runSkill(args []string, out, errOut interface{ Write([]byte) (int, error) }
 	} else if flags.NArg() != 0 {
 		return fmt.Errorf("syntroph skill %s does not accept positional arguments", command)
 	}
-	if command != "sync" && command != "list" && command != "show" {
+	if command != "sync" && command != "list" && command != "show" && command != "recovery" {
 		return fmt.Errorf("unknown skill command %q", command)
 	}
 
@@ -97,6 +101,14 @@ func runSkill(args []string, out, errOut interface{ Write([]byte) (int, error) }
 				Diagnostic: entry.Diagnostic,
 			}
 		}
+	case "recovery":
+		if *clearOrphan {
+			err = catalog.RecoverOrphanedSync(ctx)
+			if err != nil {
+				break
+			}
+		}
+		value, err = catalog.InspectSyncRecovery(ctx)
 	}
 	if err != nil {
 		return err

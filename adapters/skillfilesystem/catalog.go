@@ -17,6 +17,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
+	"unicode/utf8"
 
 	"github.com/mateusememe/syntroph/config"
 	"github.com/mateusememe/syntroph/core"
@@ -66,14 +68,22 @@ type sourceFile struct {
 }
 
 type SyncResult struct {
+	State   SyncState      `json:"state"`
+	Owner   *SyncLockOwner `json:"owner,omitempty"`
 	Entries []EntrySummary `json:"entries"`
 }
 
 type Catalog struct {
-	mu          sync.Mutex
-	catalogRoot string
-	settings    config.ResolvedSkills
-	preparer    core.SkillPort
+	mu                sync.Mutex
+	catalogRoot       string
+	settings          config.ResolvedSkills
+	preparer          core.SkillPort
+	preparerIndexHash string
+	checkpoint        func(SyncCheckpoint) error
+	processState      func(int) processState
+	now               func() time.Time
+	pid               func() int
+	ownerID           func() string
 }
 
 func New(repositoryRoot string, settings config.ResolvedSkills) (*Catalog, error) {
@@ -88,23 +98,63 @@ func New(repositoryRoot string, settings config.ResolvedSkills) (*Catalog, error
 		return nil, errors.New("resolved skill configuration is incomplete")
 	}
 	return &Catalog{
-		catalogRoot: filepath.Join(root, ".syntroph", "catalog"),
-		settings:    settings,
+		catalogRoot:  filepath.Join(root, ".syntroph", "catalog"),
+		settings:     settings,
+		processState: defaultProcessState,
+		now:          func() time.Time { return time.Now().UTC() },
+		pid:          os.Getpid,
+		ownerID:      randomSyncOwnerID,
 	}, nil
 }
 
-func (c *Catalog) Sync(ctx context.Context) (SyncResult, error) {
+func (c *Catalog) Sync(ctx context.Context) (result SyncResult, resultErr error) {
+	defer func() { resultErr = boundSyncDiagnostic(resultErr) }()
 	if err := ctx.Err(); err != nil {
 		return SyncResult{}, err
 	}
-	var lock runtimeLock
-	if err := readStrictYAML(c.settings.RuntimeLock, &lock); err != nil {
+	ownership, existingOwner, err := c.acquireSyncLock(ctx)
+	if err != nil {
+		return SyncResult{}, err
+	}
+	if existingOwner != nil {
+		switch c.processState(existingOwner.PID) {
+		case processAlive:
+			return SyncResult{State: SyncInProgress, Owner: existingOwner}, nil
+		case processDead:
+			return SyncResult{State: SyncRecoveryRequired, Owner: existingOwner}, ErrSyncRecoveryRequired
+		default:
+			return SyncResult{State: SyncRecoveryRequired, Owner: existingOwner}, ErrSyncLivenessUnverifiable
+		}
+	}
+	stagingRoot := filepath.Join(c.catalogRoot, "staging", ownership.owner.OwnerID)
+	if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
+		return SyncResult{}, errors.Join(fmt.Errorf("create skill catalog staging directory: %w", err), ownership.Release())
+	}
+	defer func() {
+		cleanupErr := os.RemoveAll(stagingRoot)
+		resultErr = errors.Join(resultErr, cleanupErr)
+		if cleanupErr == nil {
+			resultErr = errors.Join(resultErr, ownership.Release())
+		}
+	}()
+	ownerData, err := json.Marshal(ownership.owner)
+	if err != nil {
+		return SyncResult{}, fmt.Errorf("encode skill catalog staging owner: %w", err)
+	}
+	if err := writeAtomicMode(filepath.Join(stagingRoot, "owner.json"), ownerData, 0o600); err != nil {
+		return SyncResult{}, fmt.Errorf("write skill catalog staging owner: %w", err)
+	}
+	if err := c.reachCheckpoint(SyncCheckpointStagingCreated); err != nil {
+		return SyncResult{}, err
+	}
+	var runtime runtimeLock
+	if err := readStrictYAML(c.settings.RuntimeLock, &runtime); err != nil {
 		if os.IsNotExist(err) {
 			return SyncResult{}, fmt.Errorf("runtime skill lock is missing at %s; create or restore the configured lock before running syntroph skill sync", c.settings.RuntimeLock)
 		}
 		return SyncResult{}, fmt.Errorf("read runtime skill lock: %w", err)
 	}
-	if lock.SchemaVersion != RuntimeLockSchemaVersion {
+	if runtime.SchemaVersion != RuntimeLockSchemaVersion {
 		return SyncResult{}, fmt.Errorf("runtime skill lock schema_version must be %d", RuntimeLockSchemaVersion)
 	}
 	sources := make(map[string]config.ResolvedSkillSource, len(c.settings.Sources))
@@ -112,9 +162,9 @@ func (c *Catalog) Sync(ctx context.Context) (SyncResult, error) {
 		sources[source.ID] = source
 	}
 
-	entries := make([]core.SkillCatalogEntry, 0, len(lock.Packages))
+	entries := make([]core.SkillCatalogEntry, 0, len(runtime.Packages))
 	seen := make(map[string]struct{})
-	for _, declaration := range lock.Packages {
+	for _, declaration := range runtime.Packages {
 		if err := ctx.Err(); err != nil {
 			return SyncResult{}, err
 		}
@@ -122,13 +172,13 @@ func (c *Catalog) Sync(ctx context.Context) (SyncResult, error) {
 			return SyncResult{}, errors.New("local Skill Packages must use skill.yaml manifests, not runtime lock declarations")
 		}
 		if declaration.SchemaVersion == 0 {
-			declaration.SchemaVersion = lock.SchemaVersion
+			declaration.SchemaVersion = runtime.SchemaVersion
 		}
 		source, ok := sources[declaration.SourceID]
 		if !ok || declaration.SourceID == "" {
 			return SyncResult{}, fmt.Errorf("runtime lock package %q references undeclared source %q", declaration.Name, declaration.SourceID)
 		}
-		entry, err := c.loadPackage(source, declaration.Directory, declaration)
+		entry, err := c.loadPackage(source, declaration.Directory, declaration, stagingRoot)
 		if err != nil {
 			return SyncResult{}, err
 		}
@@ -137,7 +187,7 @@ func (c *Catalog) Sync(ctx context.Context) (SyncResult, error) {
 		}
 	}
 	if local, ok := sources["local"]; ok {
-		localEntries, err := c.loadLocalPackages(ctx, local)
+		localEntries, err := c.loadLocalPackages(ctx, local, stagingRoot)
 		if err != nil {
 			return SyncResult{}, err
 		}
@@ -151,17 +201,29 @@ func (c *Catalog) Sync(ctx context.Context) (SyncResult, error) {
 		return entries[i].Package.Identity.QualifiedName() < entries[j].Package.Identity.QualifiedName()
 	})
 	summaries := summarizeEntries(entries)
-	if err := c.publishIndex(summaries); err != nil {
+	if _, err := core.NewInMemorySkillPort(entries, nil); err != nil {
+		return SyncResult{}, fmt.Errorf("validate skill catalog preparer: %w", err)
+	}
+	if err := c.reachCheckpoint(SyncCheckpointStoreReady); err != nil {
 		return SyncResult{}, err
 	}
-	preparer, err := core.NewInMemorySkillPort(entries, nil)
+	stagedIndex, err := c.stageIndex(stagingRoot, summaries)
 	if err != nil {
-		return SyncResult{}, fmt.Errorf("activate skill catalog preparer: %w", err)
+		return SyncResult{}, err
 	}
-	c.mu.Lock()
-	c.preparer = preparer
-	c.mu.Unlock()
-	return SyncResult{Entries: summaries}, nil
+	if err := c.verifyStagedIndex(stagedIndex); err != nil {
+		return SyncResult{}, err
+	}
+	if err := c.reachCheckpoint(SyncCheckpointIndexStaged); err != nil {
+		return SyncResult{}, err
+	}
+	if err := c.publishStagedIndex(stagedIndex); err != nil {
+		return SyncResult{}, err
+	}
+	if err := c.reachCheckpoint(SyncCheckpointIndexPublished); err != nil {
+		return SyncResult{}, err
+	}
+	return SyncResult{State: SyncSucceeded, Entries: summaries}, nil
 }
 
 func (c *Catalog) List(ctx context.Context) ([]EntrySummary, error) {
@@ -205,32 +267,30 @@ func (c *Catalog) Show(ctx context.Context, name string) (core.SkillCatalogEntry
 
 func (c *Catalog) Prepare(ctx context.Context, request core.SkillPrepareRequest) (core.SkillBundle, error) {
 	c.mu.Lock()
-	preparer := c.preparer
-	c.mu.Unlock()
-	if preparer == nil {
-		entries, err := c.loadEntries(ctx)
-		if err != nil {
-			return core.SkillBundle{}, err
-		}
-		prepared, err := core.NewInMemorySkillPort(entries, nil)
-		if err != nil {
-			return core.SkillBundle{}, err
-		}
-		c.mu.Lock()
-		if c.preparer == nil {
-			c.preparer = prepared
-		}
-		preparer = c.preparer
-		c.mu.Unlock()
+	defer c.mu.Unlock()
+	index, encoded, err := c.readIndexData()
+	if err != nil {
+		return core.SkillBundle{}, err
 	}
-	return preparer.Prepare(ctx, request)
+	sum := sha256.Sum256(encoded)
+	indexHash := hex.EncodeToString(sum[:])
+	if c.preparer != nil && c.preparerIndexHash == indexHash {
+		return c.preparer.Prepare(ctx, request)
+	}
+	entries, err := c.loadEntriesFromIndex(ctx, index)
+	if err != nil {
+		return core.SkillBundle{}, err
+	}
+	prepared, err := core.NewInMemorySkillPort(entries, nil)
+	if err != nil {
+		return core.SkillBundle{}, err
+	}
+	c.preparer = prepared
+	c.preparerIndexHash = indexHash
+	return c.preparer.Prepare(ctx, request)
 }
 
-func (c *Catalog) loadEntries(ctx context.Context) ([]core.SkillCatalogEntry, error) {
-	index, err := c.readIndex()
-	if err != nil {
-		return nil, err
-	}
+func (c *Catalog) loadEntriesFromIndex(ctx context.Context, index catalogIndex) ([]core.SkillCatalogEntry, error) {
 	entries := make([]core.SkillCatalogEntry, 0, len(index.Entries))
 	for _, summary := range index.Entries {
 		if err := ctx.Err(); err != nil {
@@ -251,7 +311,7 @@ func (c *Catalog) loadEntries(ctx context.Context) ([]core.SkillCatalogEntry, er
 	return entries, nil
 }
 
-func (c *Catalog) loadLocalPackages(ctx context.Context, source config.ResolvedSkillSource) ([]core.SkillCatalogEntry, error) {
+func (c *Catalog) loadLocalPackages(ctx context.Context, source config.ResolvedSkillSource, stagingRoot string) ([]core.SkillCatalogEntry, error) {
 	directories, err := os.ReadDir(source.Root)
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -276,7 +336,7 @@ func (c *Catalog) loadLocalPackages(ctx context.Context, source config.ResolvedS
 			return nil, fmt.Errorf("local skill manifest %s must not declare source_id or directory", manifestPath)
 		}
 		declaration.SourceID = "local"
-		entry, err := c.loadPackage(source, directory.Name(), declaration)
+		entry, err := c.loadPackage(source, directory.Name(), declaration, stagingRoot)
 		if err != nil {
 			return nil, err
 		}
@@ -285,7 +345,7 @@ func (c *Catalog) loadLocalPackages(ctx context.Context, source config.ResolvedS
 	return entries, nil
 }
 
-func (c *Catalog) loadPackage(source config.ResolvedSkillSource, directory string, declaration packageDeclaration) (core.SkillCatalogEntry, error) {
+func (c *Catalog) loadPackage(source config.ResolvedSkillSource, directory string, declaration packageDeclaration, stagingRoot string) (core.SkillCatalogEntry, error) {
 	if err := normalizeDeclaration(&declaration); err != nil {
 		return core.SkillCatalogEntry{}, fmt.Errorf("skill package %s/%s: %w", source.ID, declaration.Name, err)
 	}
@@ -339,7 +399,7 @@ func (c *Catalog) loadPackage(source config.ResolvedSkillSource, directory strin
 		mediaType := staticMediaType(file.path)
 		pkg.Assets = append(pkg.Assets, core.SkillAsset{Path: file.path, SHA256: hex.EncodeToString(sum[:]), MediaType: mediaType})
 	}
-	if err := c.materialize(pkg, files); err != nil {
+	if err := c.materialize(pkg, files, stagingRoot); err != nil {
 		return core.SkillCatalogEntry{}, err
 	}
 	return core.SkillCatalogEntry{State: core.SkillReady, Package: pkg}, nil
@@ -437,7 +497,7 @@ func writeHashPart(writer io.Writer, value []byte) error {
 	return err
 }
 
-func (c *Catalog) materialize(pkg core.SkillPackage, files []sourceFile) error {
+func (c *Catalog) materialize(pkg core.SkillPackage, files []sourceFile, stagingRoot string) error {
 	storeRoot := filepath.Join(c.catalogRoot, "store")
 	if err := os.MkdirAll(storeRoot, 0o755); err != nil {
 		return fmt.Errorf("create skill catalog store: %w", err)
@@ -448,16 +508,20 @@ func (c *Catalog) materialize(pkg core.SkillPackage, files []sourceFile) error {
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("inspect skill store object: %w", err)
 	}
-	temporary, err := os.MkdirTemp(storeRoot, ".package-*")
-	if err != nil {
-		return fmt.Errorf("create skill store staging directory: %w", err)
+	stagingStore := filepath.Join(stagingRoot, "store")
+	if err := os.MkdirAll(stagingStore, 0o700); err != nil {
+		return fmt.Errorf("create owned skill store staging root: %w", err)
+	}
+	temporary := filepath.Join(stagingStore, pkg.Identity.PackageHash)
+	if err := os.Mkdir(temporary, 0o700); err != nil {
+		return fmt.Errorf("create owned skill store staging directory: %w", err)
 	}
 	defer os.RemoveAll(temporary)
 	encoded, err := json.MarshalIndent(pkg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode stored skill package: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(temporary, "package.json"), append(encoded, '\n'), 0o644); err != nil {
+	if err := writeFileDurable(filepath.Join(temporary, "package.json"), append(encoded, '\n'), 0o644); err != nil {
 		return fmt.Errorf("write stored skill package: %w", err)
 	}
 	for _, file := range files {
@@ -465,26 +529,117 @@ func (c *Catalog) materialize(pkg core.SkillPackage, files []sourceFile) error {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return fmt.Errorf("create stored skill package path: %w", err)
 		}
-		if err := os.WriteFile(path, file.data, 0o644); err != nil {
+		if err := writeFileDurable(path, file.data, 0o644); err != nil {
 			return fmt.Errorf("write stored skill package file %q: %w", file.path, err)
 		}
 	}
-	if err := os.Rename(temporary, target); err != nil {
+	if err := syncTreeDirectories(temporary); err != nil {
+		return fmt.Errorf("persist owned skill store staging directory: %w", err)
+	}
+	if err := c.reachCheckpoint(SyncCheckpointStoreObjectStaged); err != nil {
+		return err
+	}
+	if err := publishImmutableDirectory(temporary, target); err != nil {
 		return fmt.Errorf("publish immutable skill store object: %w", err)
+	}
+	if err := syncDirectory(storeRoot); err != nil {
+		return fmt.Errorf("persist immutable skill store object: %w", err)
 	}
 	return nil
 }
 
-func (c *Catalog) publishIndex(entries []EntrySummary) error {
+func writeFileDurable(path string, data []byte, mode os.FileMode) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	if _, err = file.Write(data); err == nil {
+		err = file.Sync()
+	}
+	closeErr := file.Close()
+	if err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func syncTreeDirectories(root string) error {
+	var directories []string
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			directories = append(directories, path)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for i := len(directories) - 1; i >= 0; i-- {
+		if err := syncDirectory(directories[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Catalog) stageIndex(stagingRoot string, entries []EntrySummary) (string, error) {
 	index := catalogIndex{SchemaVersion: 1, Aliases: cloneAliases(c.settings.Aliases), Entries: entries}
 	encoded, err := json.MarshalIndent(index, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode skill catalog index: %w", err)
+		return "", fmt.Errorf("encode skill catalog index: %w", err)
 	}
-	if err := os.MkdirAll(c.catalogRoot, 0o755); err != nil {
-		return fmt.Errorf("create skill catalog: %w", err)
+	path := filepath.Join(stagingRoot, "index.json")
+	if err := writeAtomic(path, append(encoded, '\n')); err != nil {
+		return "", fmt.Errorf("write staged skill catalog index: %w", err)
 	}
-	return writeAtomic(filepath.Join(c.catalogRoot, "index.json"), append(encoded, '\n'))
+	return path, nil
+}
+
+func (c *Catalog) verifyStagedIndex(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read staged skill catalog index: %w", err)
+	}
+	var index catalogIndex
+	if err := json.Unmarshal(data, &index); err != nil {
+		return fmt.Errorf("parse staged skill catalog index: %w", err)
+	}
+	if index.SchemaVersion != 1 {
+		return errors.New("staged skill catalog index has an unsupported schema version")
+	}
+	for _, summary := range index.Entries {
+		if summary.State != core.SkillReady {
+			continue
+		}
+		pkg, err := c.readStoredPackage(summary.Identity.PackageHash)
+		if err != nil {
+			return fmt.Errorf("verify staged skill catalog index: %w", err)
+		}
+		if pkg.Identity != summary.Identity {
+			return fmt.Errorf("verify staged skill catalog index: store identity mismatch for %s", summary.Identity.QualifiedName())
+		}
+	}
+	return nil
+}
+
+func (c *Catalog) publishStagedIndex(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read staged skill catalog index for publication: %w", err)
+	}
+	if err := writeAtomic(filepath.Join(c.catalogRoot, "index.json"), data); err != nil {
+		return fmt.Errorf("publish active skill catalog index: %w", err)
+	}
+	return nil
+}
+
+func (c *Catalog) reachCheckpoint(checkpoint SyncCheckpoint) error {
+	if c.checkpoint == nil {
+		return nil
+	}
+	return c.checkpoint(checkpoint)
 }
 
 func summarizeEntries(entries []core.SkillCatalogEntry) []EntrySummary {
@@ -496,18 +651,23 @@ func summarizeEntries(entries []core.SkillCatalogEntry) []EntrySummary {
 }
 
 func (c *Catalog) readIndex() (catalogIndex, error) {
+	index, _, err := c.readIndexData()
+	return index, err
+}
+
+func (c *Catalog) readIndexData() (catalogIndex, []byte, error) {
 	var index catalogIndex
 	data, err := os.ReadFile(filepath.Join(c.catalogRoot, "index.json"))
 	if err != nil {
-		return index, fmt.Errorf("read active skill catalog index: %w", err)
+		return index, nil, fmt.Errorf("read active skill catalog index: %w", err)
 	}
 	if err := json.Unmarshal(data, &index); err != nil {
-		return index, fmt.Errorf("parse active skill catalog index: %w", err)
+		return index, nil, fmt.Errorf("parse active skill catalog index: %w", err)
 	}
 	if index.SchemaVersion != 1 {
-		return index, errors.New("active skill catalog index has an unsupported schema version")
+		return index, nil, errors.New("active skill catalog index has an unsupported schema version")
 	}
-	return index, nil
+	return index, data, nil
 }
 
 func (c *Catalog) readStoredPackage(packageHash string) (core.SkillPackage, error) {
@@ -577,13 +737,17 @@ func cloneAliases(aliases map[string]string) map[string]string {
 }
 
 func writeAtomic(path string, data []byte) error {
+	return writeAtomicMode(path, data, 0o644)
+}
+
+func writeAtomicMode(path string, data []byte, mode os.FileMode) error {
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".index-*")
 	if err != nil {
 		return err
 	}
 	name := temporary.Name()
 	defer os.Remove(name)
-	if err := temporary.Chmod(0o644); err != nil {
+	if err := temporary.Chmod(mode); err != nil {
 		_ = temporary.Close()
 		return err
 	}
@@ -598,7 +762,33 @@ func writeAtomic(path string, data []byte) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	return os.Rename(name, path)
+	if err := replaceFileAtomically(name, path); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
+}
+
+const maxSyncDiagnosticBytes = 1024
+
+type boundedSyncDiagnostic struct {
+	cause   error
+	message string
+}
+
+func (e boundedSyncDiagnostic) Error() string { return e.message }
+func (e boundedSyncDiagnostic) Unwrap() error { return e.cause }
+
+func boundSyncDiagnostic(err error) error {
+	if err == nil || len(err.Error()) <= maxSyncDiagnosticBytes {
+		return err
+	}
+	const suffix = "... [truncated]"
+	message := err.Error()
+	end := maxSyncDiagnosticBytes - len(suffix)
+	for end > 0 && !utf8.RuneStart(message[end]) {
+		end--
+	}
+	return boundedSyncDiagnostic{cause: err, message: message[:end] + suffix}
 }
 
 var _ core.SkillPort = (*Catalog)(nil)
