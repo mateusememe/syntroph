@@ -1,0 +1,3 @@
+# Skill invocations preserve provenance in session memory
+
+Every intentional Skill Invocation has its own identity and saga, while technical replay reuses that identity. A Session Artifact carries portable Skill Invocation Records that are marked journal-verified when local evidence agrees or runtime-declared when no journal is available; session close links and snapshots those records inside the immutable Session Diary without promoting their decisions or lessons into top-level memory. Graph resolution includes nested code references and writes results back to their originating invocation, preserving both provenance and the local-first success contract.
