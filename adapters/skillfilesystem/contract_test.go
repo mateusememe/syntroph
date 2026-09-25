@@ -25,6 +25,11 @@ packages:
     instructions: SKILL.md
     files: [SKILL.md]
     compatible_runtimes: [codex]
+    arguments_schema:
+      type: object
+      properties:
+        fixed_point:
+          type: string
   - source_id: source
     name: broken
     directory: broken

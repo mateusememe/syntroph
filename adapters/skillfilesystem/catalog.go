@@ -216,7 +216,7 @@ func (c *Catalog) Sync(ctx context.Context) (result SyncResult, resultErr error)
 		return entries[i].Package.Identity.QualifiedName() < entries[j].Package.Identity.QualifiedName()
 	})
 	summaries := summarizeEntries(entries)
-	if _, err := core.NewInMemorySkillPort(entries, nil); err != nil {
+	if _, err := core.NewInMemorySkillPort(entries, c.settings.Aliases, nil); err != nil {
 		return SyncResult{}, fmt.Errorf("validate skill catalog preparer: %w", err)
 	}
 	if err := c.reachCheckpoint(SyncCheckpointStoreReady); err != nil {
@@ -407,7 +407,7 @@ func (c *Catalog) Prepare(ctx context.Context, request core.SkillPrepareRequest)
 	if err != nil {
 		return core.SkillBundle{}, err
 	}
-	prepared, err := core.NewInMemorySkillPort(entries, nil)
+	prepared, err := core.NewInMemorySkillPort(entries, index.Aliases, nil)
 	if err != nil {
 		return core.SkillBundle{}, err
 	}
@@ -979,6 +979,15 @@ func cloneAliases(aliases map[string]string) map[string]string {
 
 func writeAtomic(path string, data []byte) error {
 	return writeAtomicMode(path, data, 0o644)
+}
+
+// WritePrivateFile atomically writes data to path with mode 0600, using the
+// same cross-platform atomic-replace primitives as the content-addressed
+// store. `syntroph skill prepare --output` uses this to hand off a prepared
+// Skill Bundle without exposing it to other local users or leaving a
+// partially written file behind after an interruption.
+func WritePrivateFile(path string, data []byte) error {
+	return writeAtomicMode(path, data, 0o600)
 }
 
 func writeAtomicMode(path string, data []byte, mode os.FileMode) error {
