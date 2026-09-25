@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -35,11 +38,11 @@ type skillPackageMetadata struct {
 
 func runSkill(args []string, out, errOut interface{ Write([]byte) (int, error) }) error {
 	if len(args) == 0 {
-		return errors.New("usage: syntroph skill <sync|list|show|verify|recovery> [--root repository]")
+		return errors.New("usage: syntroph skill <sync|list|show|verify|prepare|recovery> [--root repository]")
 	}
 	command := args[0]
 	commandArgs := args[1:]
-	if (command == "show" || command == "verify") && len(commandArgs) > 0 && !strings.HasPrefix(commandArgs[0], "-") {
+	if (command == "show" || command == "verify" || command == "prepare") && len(commandArgs) > 0 && !strings.HasPrefix(commandArgs[0], "-") {
 		commandArgs = append(append([]string(nil), commandArgs[1:]...), commandArgs[0])
 	}
 	flags := flag.NewFlagSet("skill "+command, flag.ContinueOnError)
@@ -49,12 +52,20 @@ func runSkill(args []string, out, errOut interface{ Write([]byte) (int, error) }
 	if command == "recovery" {
 		clearOrphan = flags.Bool("clear-orphan", false, "clear synchronization state after process-liveness verification")
 	}
+	var prepareRuntime, prepareArguments, prepareArgumentsFile, prepareInvocationID, prepareOutput *string
+	if command == "prepare" {
+		prepareRuntime = flags.String("runtime", "", "runtime to validate compatibility against and record as a hint")
+		prepareArguments = flags.String("arguments", "", "skill arguments as a JSON object")
+		prepareArgumentsFile = flags.String("arguments-file", "", "path to a file containing skill arguments as a JSON object")
+		prepareInvocationID = flags.String("invocation-id", "", "explicit invocation id; repeating it replays the same bundle identity")
+		prepareOutput = flags.String("output", "", "write the prepared bundle atomically to this file with mode 0600 instead of stdout")
+	}
 	if err := flags.Parse(commandArgs); err != nil {
 		return err
 	}
-	if command == "show" {
+	if command == "show" || command == "prepare" {
 		if flags.NArg() != 1 {
-			return errors.New("syntroph skill show requires one qualified package name")
+			return fmt.Errorf("syntroph skill %s requires one qualified name, alias, or unique unqualified name", command)
 		}
 	} else if command == "verify" {
 		if flags.NArg() > 1 {
@@ -63,7 +74,7 @@ func runSkill(args []string, out, errOut interface{ Write([]byte) (int, error) }
 	} else if flags.NArg() != 0 {
 		return fmt.Errorf("syntroph skill %s does not accept positional arguments", command)
 	}
-	if command != "sync" && command != "list" && command != "show" && command != "verify" && command != "recovery" {
+	if command != "sync" && command != "list" && command != "show" && command != "verify" && command != "prepare" && command != "recovery" {
 		return fmt.Errorf("unknown skill command %q", command)
 	}
 
@@ -85,6 +96,15 @@ func runSkill(args []string, out, errOut interface{ Write([]byte) (int, error) }
 	ctx := context.Background()
 	if command == "verify" {
 		return runSkillVerify(ctx, catalog, flags.Arg(0), out)
+	}
+	if command == "prepare" {
+		return runSkillPrepare(ctx, catalog, flags.Arg(0), skillPrepareOptions{
+			runtime:       *prepareRuntime,
+			arguments:     *prepareArguments,
+			argumentsFile: *prepareArgumentsFile,
+			invocationID:  *prepareInvocationID,
+			output:        *prepareOutput,
+		}, out)
 	}
 	var value any
 	switch command {
@@ -139,4 +159,86 @@ func runSkillVerify(ctx context.Context, catalog *skillfilesystem.Catalog, name 
 		}
 	}
 	return verifyErr
+}
+
+// skillPrepareOptions collects the flags accepted by `syntroph skill
+// prepare`.
+type skillPrepareOptions struct {
+	runtime       string
+	arguments     string
+	argumentsFile string
+	invocationID  string
+	output        string
+}
+
+// runSkillPrepare resolves name (a canonical qualified name, an explicit
+// alias, or a unique unqualified name), validates and prepares its
+// immutable Skill Bundle, and emits the complete bundle as JSON: to stdout
+// by default, or atomically to opts.output with private mode 0600. It never
+// writes anywhere else, so a caller-selected output path is the only file
+// this command can create.
+func runSkillPrepare(ctx context.Context, catalog *skillfilesystem.Catalog, name string, opts skillPrepareOptions, out interface{ Write([]byte) (int, error) }) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("syntroph skill prepare requires one qualified name, alias, or unique unqualified name")
+	}
+	if opts.arguments != "" && opts.argumentsFile != "" {
+		return errors.New("syntroph skill prepare accepts at most one of --arguments or --arguments-file")
+	}
+	arguments, err := parseSkillPrepareArguments(opts)
+	if err != nil {
+		return err
+	}
+	bundle, err := catalog.Prepare(ctx, core.SkillPrepareRequest{
+		Name:         name,
+		InvocationID: strings.TrimSpace(opts.invocationID),
+		Runtime:      strings.TrimSpace(opts.runtime),
+		Arguments:    arguments,
+	})
+	if err != nil {
+		return err
+	}
+	encoded, err := json.MarshalIndent(bundle, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode prepared skill bundle: %w", err)
+	}
+	encoded = append(encoded, '\n')
+	if opts.output == "" {
+		_, err := out.Write(encoded)
+		return err
+	}
+	return skillfilesystem.WritePrivateFile(opts.output, encoded)
+}
+
+func parseSkillPrepareArguments(opts skillPrepareOptions) (map[string]any, error) {
+	var raw []byte
+	switch {
+	case opts.argumentsFile != "":
+		data, err := os.ReadFile(opts.argumentsFile)
+		if err != nil {
+			return nil, fmt.Errorf("read skill arguments file: %w", err)
+		}
+		raw = data
+	case opts.arguments != "":
+		raw = []byte(opts.arguments)
+	default:
+		return nil, nil
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var arguments map[string]any
+	if err := decoder.Decode(&arguments); err != nil {
+		return nil, fmt.Errorf("parse skill arguments JSON: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, errors.New("skill arguments must contain exactly one JSON object")
+		}
+		return nil, fmt.Errorf("parse skill arguments JSON: %w", err)
+	}
+	return arguments, nil
 }

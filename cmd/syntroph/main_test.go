@@ -298,6 +298,195 @@ func writeSkillCLIFile(t *testing.T, path, contents string) {
 	}
 }
 
+func skillPrepareCLIRepository(t *testing.T) string {
+	t.Helper()
+	repositoryRoot := t.TempDir()
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "config.yaml"), `skills:
+  enabled: true
+  runtime_lock: .syntroph/skills.runtime.lock.yaml
+  sources:
+    - id: source
+      path: skills
+  aliases:
+    review: source/code-review
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "skills.runtime.lock.yaml"), `schema_version: 1
+packages:
+  - source_id: source
+    name: code-review
+    directory: code-review
+    description: Review repository changes
+    license: MIT
+    source_url: https://example.test/skills
+    source_revision: revision-1
+    instructions: SKILL.md
+    files: [SKILL.md]
+    compatible_runtimes: [codex]
+    arguments_schema:
+      type: object
+      properties:
+        fixed_point:
+          type: string
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, "skills", "code-review", "SKILL.md"), "# Code Review\n\nReview the supplied diff.\n")
+	var syncOut bytes.Buffer
+	if err := run([]string{"skill", "sync", "--root", repositoryRoot}, &syncOut, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	return repositoryRoot
+}
+
+func TestSkillPrepareWritesCompleteBundleJSONToStdout(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	var out bytes.Buffer
+	if err := run([]string{
+		"skill", "prepare", "source/code-review",
+		"--root", repositoryRoot,
+		"--invocation-id", "inv-cli-stdout",
+		"--runtime", "codex",
+		"--arguments", `{"fixed_point": "origin/main"}`,
+	}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	var bundle map[string]any
+	if err := json.Unmarshal(out.Bytes(), &bundle); err != nil {
+		t.Fatalf("skill prepare did not emit valid JSON: %v\n%s", err, out.String())
+	}
+	for _, want := range []string{`"invocation_id": "inv-cli-stdout"`, `"bundle_hash"`, `"instructions"`, `"runtime": "codex"`} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("skill prepare output missing %q: %s", want, out.String())
+		}
+	}
+}
+
+func TestSkillPrepareResolvesAliasFromConfiguredCatalog(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	var out bytes.Buffer
+	if err := run([]string{"skill", "prepare", "review", "--root", repositoryRoot, "--invocation-id", "inv-cli-alias"}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"name": "code-review"`) {
+		t.Fatalf("alias prepare did not resolve to the aliased package: %s", out.String())
+	}
+}
+
+func TestSkillPrepareReplayWithExplicitInvocationIDReproducesTheSameBundle(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	var first, second bytes.Buffer
+	args := []string{"skill", "prepare", "source/code-review", "--root", repositoryRoot, "--invocation-id", "inv-cli-replay"}
+	if err := run(args, &first, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(args, &second, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if first.String() != second.String() {
+		t.Fatalf("replay with explicit invocation id produced different bundles:\nfirst=%s\nsecond=%s", first.String(), second.String())
+	}
+}
+
+func TestSkillPrepareWritesOutputFileAtomicallyWithPrivateMode(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	outputPath := filepath.Join(t.TempDir(), "bundle.json")
+	var out bytes.Buffer
+	if err := run([]string{
+		"skill", "prepare", "source/code-review",
+		"--root", repositoryRoot,
+		"--invocation-id", "inv-cli-output",
+		"--output", outputPath,
+	}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("skill prepare wrote to stdout in addition to --output: %s", out.String())
+	}
+	info, err := os.Stat(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("prepared bundle file mode = %o, want 0600", perm)
+	}
+	contents, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bundle map[string]any
+	if err := json.Unmarshal(contents, &bundle); err != nil {
+		t.Fatalf("output file did not contain valid JSON: %v", err)
+	}
+}
+
+func TestSkillPrepareFailsForAmbiguousUnqualifiedName(t *testing.T) {
+	repositoryRoot := t.TempDir()
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "config.yaml"), `skills:
+  enabled: true
+  runtime_lock: .syntroph/skills.runtime.lock.yaml
+  sources:
+    - id: first
+      path: first
+    - id: second
+      path: second
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "skills.runtime.lock.yaml"), `schema_version: 1
+packages:
+  - source_id: first
+    name: review
+    directory: review
+    description: First review
+    license: MIT
+    source_url: https://example.test/first
+    source_revision: revision-1
+    instructions: SKILL.md
+    files: [SKILL.md]
+  - source_id: second
+    name: review
+    directory: review
+    description: Second review
+    license: MIT
+    source_url: https://example.test/second
+    source_revision: revision-1
+    instructions: SKILL.md
+    files: [SKILL.md]
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, "first", "review", "SKILL.md"), "# First\n")
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, "second", "review", "SKILL.md"), "# Second\n")
+	var syncOut bytes.Buffer
+	if err := run([]string{"skill", "sync", "--root", repositoryRoot}, &syncOut, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err := run([]string{"skill", "prepare", "review", "--root", repositoryRoot}, &out, os.Stderr)
+	if err == nil {
+		t.Fatal("expected an error for an ambiguous unqualified skill name")
+	}
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous prepare error = %v, want it to mention ambiguity", err)
+	}
+}
+
+func TestSkillPrepareFailsWhenRuntimeIsIncompatible(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	var out bytes.Buffer
+	err := run([]string{"skill", "prepare", "source/code-review", "--root", repositoryRoot, "--runtime", "antigravity"}, &out, os.Stderr)
+	if err == nil {
+		t.Fatal("expected an error for an incompatible runtime")
+	}
+}
+
+func TestSkillPrepareFailsWhenArgumentsViolateTheDeclaredSchema(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	var out bytes.Buffer
+	err := run([]string{
+		"skill", "prepare", "source/code-review",
+		"--root", repositoryRoot,
+		"--arguments", `{"undeclared_field": true}`,
+	}, &out, os.Stderr)
+	if err == nil {
+		t.Fatal("expected an error for undeclared skill arguments")
+	}
+}
+
 func TestSyncResolveShowsDiffAndRequiresExplicitChoice(t *testing.T) {
 	dir := t.TempDir()
 	local, remote := filepath.Join(dir, "local"), filepath.Join(dir, "remote")
