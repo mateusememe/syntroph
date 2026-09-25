@@ -154,7 +154,7 @@ func closeSession(args []string, out, errOut interface{ Write([]byte) (int, erro
 	}
 	formatValue := core.ArtifactFormat(strings.ToLower(*format))
 	storagePort := configuredStorage(*root, filepath.Dir(*root))
-	diary, delivery, err := (core.SessionCloser{Memory: memory, Bus: bus, Graph: graph, Storage: storagePort}).Close(context.Background(), core.SessionCloseRequest{RepositoryID: *repo, CommitSHA: *sha, Author: *author, Runtime: *runtime, Artifact: data, Format: formatValue, ManualSummary: *summary})
+	diary, delivery, err := (core.SessionCloser{Memory: memory, Bus: bus, Graph: graph, Storage: storagePort}).Close(context.Background(), core.SessionCloseRequest{RepositoryID: *repo, CommitSHA: *sha, Author: *author, Runtime: *runtime, RepositoryRoot: filepath.Dir(*root), Artifact: data, Format: formatValue, ManualSummary: *summary})
 	if err != nil {
 		return err
 	}

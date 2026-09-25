@@ -71,10 +71,13 @@ type SkillObservation struct {
 	Lessons   []string `json:"lessons,omitempty"`
 }
 
-// SkillInvocationArtifact is repository-relative, runtime-declared metadata
-// about a file a Skill Invocation produced. It is opaque pass-through data
-// at this layer: verifying it against the filesystem (hash, media type,
-// size, availability) is issue #27's responsibility.
+// SkillInvocationArtifact is repository-relative metadata about a file a
+// Skill Invocation produced. A runtime declares only Path; session close
+// verifies it against the filesystem and computes SHA256, MediaType,
+// SizeBytes, and Availability itself (issue #27) -- a caller-supplied value
+// for those fields is never trusted. Session close never copies the
+// artifact's contents anywhere: this metadata is all a Session Diary, and
+// any remote mirror of it, ever carries.
 type SkillInvocationArtifact struct {
 	Path         string `json:"path"`
 	SHA256       string `json:"sha256,omitempty"`
@@ -89,10 +92,10 @@ type SkillInvocationArtifact struct {
 // accepted, preserves it in a dedicated Session Diary section without
 // flattening its nested observations into top-level decisions or lessons.
 //
-// Nested code references and artifact metadata are opaque pass-through
-// data at this layer -- resolving code references through GraphPort and
-// verifying artifacts against the filesystem is issue #27's
-// responsibility, not this one's.
+// Nested code references are resolved through GraphPort in the same
+// deduplicated batch as the Session Artifact's top-level references, and
+// nested artifact metadata is verified against the filesystem, during
+// session close (issue #27; ADR 0028).
 type SkillInvocationRecord struct {
 	SchemaVersion       int                       `json:"schema_version"`
 	InvocationID        string                    `json:"invocation_id"`
@@ -154,10 +157,18 @@ func validateSkillInvocationRecord(r SkillInvocationRecord) (SkillInvocationReco
 		}
 	}
 	for i := range r.Artifacts {
-		r.Artifacts[i].Path = strings.TrimSpace(r.Artifacts[i].Path)
-		if r.Artifacts[i].Path == "" {
-			return SkillInvocationRecord{}, fmt.Errorf("%w: artifact path is required", ErrSkillInvocationRecordInvalid)
+		normalized, pathErr := normalizeArtifactPath(r.Artifacts[i].Path)
+		if pathErr != nil {
+			return SkillInvocationRecord{}, fmt.Errorf("%w: %w", ErrSkillInvocationRecordInvalid, pathErr)
 		}
+		r.Artifacts[i].Path = normalized
+		// SHA-256, media type, size, and availability are always
+		// Core-computed against the real filesystem during session close
+		// (issue #27); a caller-supplied value is never trusted.
+		r.Artifacts[i].SHA256 = ""
+		r.Artifacts[i].MediaType = ""
+		r.Artifacts[i].SizeBytes = 0
+		r.Artifacts[i].Availability = ""
 	}
 	normalizedArguments, err := normalizeSkillArguments(r.Arguments)
 	if err != nil {

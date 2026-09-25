@@ -157,14 +157,19 @@ func parseMarkdownArtifact(markdown string) (SessionArtifact, error) {
 }
 
 type SessionCloseRequest struct {
-	RepositoryID  string
-	CommitSHA     string
-	Author        string
-	Runtime       string
-	Artifact      []byte
-	Format        ArtifactFormat
-	ManualSummary string
-	Now           time.Time
+	RepositoryID string
+	CommitSHA    string
+	Author       string
+	Runtime      string
+	// RepositoryRoot is the filesystem directory Skill Invocation Artifact
+	// paths are resolved against. It defaults to "." (the process's
+	// current directory) when empty, matching the Repository Installation
+	// convention already used to configure remote storage.
+	RepositoryRoot string
+	Artifact       []byte
+	Format         ArtifactFormat
+	ManualSummary  string
+	Now            time.Time
 }
 
 // SessionDiary's SkillInvocations field is the dedicated, immutable home
@@ -286,31 +291,27 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 		}
 		skillInvocations[i] = reconciled
 	}
+	// Runtime artifact evidence is verified against the real filesystem
+	// here, before anything is written to the diary: an unsafe path fails
+	// the close outright, and a safe-but-missing one is recorded as such
+	// without failing it (issue #27).
+	repositoryRoot := strings.TrimSpace(req.RepositoryRoot)
+	if repositoryRoot == "" {
+		repositoryRoot = "."
+	}
+	for i := range skillInvocations {
+		verified, artifactErr := verifyInvocationArtifacts(repositoryRoot, skillInvocations[i].Artifacts)
+		if artifactErr != nil {
+			return SessionDiary{}, Delivery{}, artifactErr
+		}
+		skillInvocations[i].Artifacts = verified
+	}
 	now := req.Now
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
 	now = now.UTC()
-	refs := a.CodeReferences
-	graphState := GraphResolutionPending
-	var graphSnapshotID string
-	if c.Graph != nil {
-		resolution, graphErr := c.Graph.Resolve(ctx, GraphResolveRequest{RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, References: refs})
-		if graphErr != nil {
-			graphState = GraphResolutionPending
-			refs = unresolvedReferences(refs, req.RepositoryID, req.CommitSHA)
-		} else {
-			refs = resolution.References
-			graphSnapshotID = resolution.GraphSnapshotID
-			graphState = GraphReady
-			if publisher, ok := c.Graph.(GraphPublisher); ok {
-				_, publishErr := publisher.Publish(ctx, GraphSnapshot{RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, References: refs})
-				if publishErr != nil {
-					graphState = GraphSyncPending
-				}
-			}
-		}
-	}
+	refs, skillInvocations, graphState, graphSnapshotID := c.resolveCodeReferences(ctx, req, a.CodeReferences, skillInvocations)
 	diary := SessionDiary{SessionID: key[:24], IdempotencyKey: key, RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, ArtifactHash: artifactHash, Author: req.Author, Runtime: req.Runtime, CreatedAt: now, Title: a.Title, Summary: a.Summary, Decisions: a.Decisions, Lessons: a.Lessons, CodeReferences: refs, Related: a.Related, GraphSnapshotID: graphSnapshotID, GraphState: graphState, SkillInvocations: skillInvocations}
 	if err := c.Memory.SaveDiary(ctx, diary); err != nil {
 		return SessionDiary{}, Delivery{}, err
@@ -450,6 +451,96 @@ func emitSkillInvocationLinks(ctx context.Context, journal *SagaJournal, diary S
 		}
 	}
 	return nil
+}
+
+// codeReferenceKey identifies a code reference's declared location for
+// deduplication across a Session Artifact's top-level code references and
+// every Skill Invocation Record's nested code references. Repository,
+// commit, confidence, and graph snapshot identity are always
+// GraphPort-computed, so they never participate in identity.
+type codeReferenceKey struct {
+	Path, Symbol, Kind string
+}
+
+func codeReferenceKeyOf(ref CodeReference) codeReferenceKey {
+	return codeReferenceKey{Path: ref.Path, Symbol: ref.Symbol, Kind: ref.Kind}
+}
+
+// resolveCodeReferences resolves a Session Artifact's top-level code
+// references together with every Skill Invocation Record's nested code
+// references in one deduplicated GraphPort batch, then writes each result
+// back to every location -- top-level and nested -- that declared it
+// (issue #27; ADR 0028). A GraphPort failure preserves every top-level and
+// nested reference, marking each Graph Resolution Pending, rather than
+// dropping any of them.
+func (c SessionCloser) resolveCodeReferences(ctx context.Context, req SessionCloseRequest, topLevel []CodeReference, invocations []SkillInvocationRecord) ([]CodeReference, []SkillInvocationRecord, string, string) {
+	invocations = append([]SkillInvocationRecord(nil), invocations...)
+	if c.Graph == nil {
+		return topLevel, invocations, GraphResolutionPending, ""
+	}
+
+	seen := make(map[codeReferenceKey]struct{})
+	var batch []CodeReference
+	appendUnseen := func(refs []CodeReference) {
+		for _, ref := range refs {
+			key := codeReferenceKeyOf(ref)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			batch = append(batch, ref)
+		}
+	}
+	appendUnseen(topLevel)
+	for _, invocation := range invocations {
+		appendUnseen(invocation.CodeReferences)
+	}
+
+	resolution, graphErr := c.Graph.Resolve(ctx, GraphResolveRequest{RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, References: batch})
+	if graphErr != nil {
+		resolvedTop := unresolvedReferences(topLevel, req.RepositoryID, req.CommitSHA)
+		for i := range invocations {
+			invocations[i].CodeReferences = unresolvedReferences(invocations[i].CodeReferences, req.RepositoryID, req.CommitSHA)
+		}
+		return resolvedTop, invocations, GraphResolutionPending, ""
+	}
+
+	resolvedByKey := make(map[codeReferenceKey]CodeReference, len(resolution.References))
+	for _, resolved := range resolution.References {
+		resolvedByKey[codeReferenceKeyOf(resolved)] = resolved
+	}
+	resolvedTop := applyResolvedReferences(topLevel, resolvedByKey)
+	for i := range invocations {
+		invocations[i].CodeReferences = applyResolvedReferences(invocations[i].CodeReferences, resolvedByKey)
+	}
+
+	graphState, graphSnapshotID := GraphReady, resolution.GraphSnapshotID
+	if publisher, ok := c.Graph.(GraphPublisher); ok {
+		_, publishErr := publisher.Publish(ctx, GraphSnapshot{RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, References: resolution.References})
+		if publishErr != nil {
+			graphState = GraphSyncPending
+		}
+	}
+	return resolvedTop, invocations, graphState, graphSnapshotID
+}
+
+// applyResolvedReferences writes each GraphPort-resolved reference back to
+// every position in refs that declared it, leaving any reference GraphPort
+// did not return (it should always return every requested reference)
+// unchanged rather than dropping it.
+func applyResolvedReferences(refs []CodeReference, resolvedByKey map[codeReferenceKey]CodeReference) []CodeReference {
+	if len(refs) == 0 {
+		return refs
+	}
+	out := make([]CodeReference, len(refs))
+	for i, ref := range refs {
+		if resolved, ok := resolvedByKey[codeReferenceKeyOf(ref)]; ok {
+			out[i] = resolved
+			continue
+		}
+		out[i] = ref
+	}
+	return out
 }
 
 func unresolvedReferences(refs []CodeReference, repositoryID, commitSHA string) []CodeReference {
