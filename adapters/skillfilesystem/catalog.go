@@ -28,7 +28,22 @@ import (
 const (
 	RuntimeLockSchemaVersion = 1
 	LocalManifestName        = "skill.yaml"
+	maxSkillDiagnosticBytes  = 1024
+	maxInstructionsBytes     = 256 * 1024
+	maxAssetBytes            = 1024 * 1024
+	maxBundleBytes           = 5 * 1024 * 1024
+	maxPackageFiles          = 128
+	maxDirectoryDepth        = 8
+	maxManifestBytes         = 256 * 1024
 )
+
+type packageValidationError struct{ message string }
+
+func (e *packageValidationError) Error() string { return e.message }
+
+func invalidPackage(format string, args ...any) error {
+	return &packageValidationError{message: fmt.Sprintf(format, args...)}
+}
 
 type packageDeclaration struct {
 	SchemaVersion      int            `yaml:"schema_version" json:"schema_version"`
@@ -265,6 +280,117 @@ func (c *Catalog) Show(ctx context.Context, name string) (core.SkillCatalogEntry
 	return core.SkillCatalogEntry{}, fmt.Errorf("%w: %s", core.ErrSkillNotFound, name)
 }
 
+// Verify inspects the active catalog index — optionally narrowed to one
+// qualified package name — and confirms that every Ready entry's immutable
+// store content still matches what was recorded when it was synchronized.
+// It never re-reads Skill Sources or the runtime lock: drift observed here
+// means the local content-addressed store itself changed after publication.
+// The returned error wraps core.ErrUnsupportedSkill whenever the requested
+// package, or any package in a whole-catalog verification, is not Ready or
+// has drifted, so CLI callers can surface a non-zero result.
+func (c *Catalog) Verify(ctx context.Context, name string) ([]EntrySummary, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	index, err := c.readIndex()
+	if err != nil {
+		return nil, err
+	}
+	entries := append([]EntrySummary(nil), index.Entries...)
+	name = strings.TrimSpace(name)
+	if name != "" {
+		found := false
+		for _, entry := range entries {
+			if entry.Identity.QualifiedName() == name {
+				entries = []EntrySummary{entry}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("%w: %s", core.ErrSkillNotFound, name)
+		}
+	}
+	invalid := 0
+	for i := range entries {
+		if entries[i].State != core.SkillReady {
+			invalid++
+			continue
+		}
+		if driftErr := c.verifyStoredPackageIntegrity(entries[i].Identity.PackageHash); driftErr != nil {
+			diagnostic := strings.TrimSpace(driftErr.Error())
+			if len(diagnostic) > maxSkillDiagnosticBytes {
+				diagnostic = diagnostic[:maxSkillDiagnosticBytes]
+			}
+			entries[i] = EntrySummary{State: core.UnsupportedSkillPackage, Identity: entries[i].Identity, Diagnostic: diagnostic}
+			invalid++
+		}
+	}
+	if invalid > 0 {
+		return entries, fmt.Errorf("%w: %d of %d skill package(s) failed verification", core.ErrUnsupportedSkill, invalid, len(entries))
+	}
+	return entries, nil
+}
+
+// verifyStoredPackageIntegrity recomputes the recorded package's declared
+// files from the immutable store and compares them against the metadata
+// captured at materialization time. Diagnostics stay store-relative so they
+// never leak the host's absolute repository path.
+func (c *Catalog) verifyStoredPackageIntegrity(packageHash string) error {
+	pkg, err := c.readStoredPackage(packageHash)
+	if err != nil {
+		return errors.New("stored skill package is missing or unreadable")
+	}
+	filesRoot := filepath.Join(c.catalogRoot, "store", packageHash, "files")
+	want := make(map[string]struct{}, len(pkg.Assets)+1)
+	if pkg.InstructionsPath != "" {
+		want[pkg.InstructionsPath] = struct{}{}
+		data, readErr := os.ReadFile(filepath.Join(filesRoot, filepath.FromSlash(pkg.InstructionsPath)))
+		if readErr != nil {
+			return fmt.Errorf("stored instructions file %q is missing or unreadable", pkg.InstructionsPath)
+		}
+		if string(data) != pkg.Instructions {
+			return fmt.Errorf("stored instructions file %q has drifted from the recorded package", pkg.InstructionsPath)
+		}
+	}
+	for _, asset := range pkg.Assets {
+		want[asset.Path] = struct{}{}
+		data, readErr := os.ReadFile(filepath.Join(filesRoot, filepath.FromSlash(asset.Path)))
+		if readErr != nil {
+			return fmt.Errorf("stored asset %q is missing or unreadable", asset.Path)
+		}
+		sum := sha256.Sum256(data)
+		if hex.EncodeToString(sum[:]) != asset.SHA256 {
+			return fmt.Errorf("stored asset %q has drifted from its recorded hash", asset.Path)
+		}
+	}
+	var extra string
+	walkErr := filepath.WalkDir(filesRoot, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(filesRoot, path)
+		if relErr != nil {
+			return relErr
+		}
+		rel = filepath.ToSlash(rel)
+		if _, ok := want[rel]; !ok && extra == "" {
+			extra = rel
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return errors.New("stored skill package files are unreadable")
+	}
+	if extra != "" {
+		return fmt.Errorf("stored package contains undeclared file %q", extra)
+	}
+	return nil
+}
+
 func (c *Catalog) Prepare(ctx context.Context, request core.SkillPrepareRequest) (core.SkillBundle, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -330,10 +456,16 @@ func (c *Catalog) loadLocalPackages(ctx context.Context, source config.ResolvedS
 		manifestPath := filepath.Join(source.Root, directory.Name(), LocalManifestName)
 		var declaration packageDeclaration
 		if err := readStrictYAML(manifestPath, &declaration); err != nil {
-			return nil, fmt.Errorf("read local skill manifest %s: %w", manifestPath, err)
+			var pathErr *os.PathError
+			if errors.As(err, &pathErr) && !os.IsNotExist(err) {
+				return nil, fmt.Errorf("read local skill manifest: %w", err)
+			}
+			entries = append(entries, unsupportedEntry("local", directory.Name(), directory.Name(), invalidPackage("manifest is invalid: %v", safeManifestDiagnostic(err))))
+			continue
 		}
 		if declaration.SourceID != "" || declaration.Directory != "" {
-			return nil, fmt.Errorf("local skill manifest %s must not declare source_id or directory", manifestPath)
+			entries = append(entries, unsupportedEntry("local", declaration.Name, directory.Name(), invalidPackage("manifest must not declare source_id or directory")))
+			continue
 		}
 		declaration.SourceID = "local"
 		entry, err := c.loadPackage(source, directory.Name(), declaration, stagingRoot)
@@ -345,33 +477,63 @@ func (c *Catalog) loadLocalPackages(ctx context.Context, source config.ResolvedS
 	return entries, nil
 }
 
+func safeManifestDiagnostic(err error) string {
+	if os.IsNotExist(err) {
+		return LocalManifestName + " is missing"
+	}
+	return strings.TrimSpace(err.Error())
+}
+
 func (c *Catalog) loadPackage(source config.ResolvedSkillSource, directory string, declaration packageDeclaration, stagingRoot string) (core.SkillCatalogEntry, error) {
 	if err := normalizeDeclaration(&declaration); err != nil {
-		return core.SkillCatalogEntry{}, fmt.Errorf("skill package %s/%s: %w", source.ID, declaration.Name, err)
+		return unsupportedEntry(source.ID, declaration.Name, directory, err), nil
 	}
 	if source.ID != declaration.SourceID {
-		return core.SkillCatalogEntry{}, fmt.Errorf("skill package %s/%s source identity does not match its declared source", source.ID, declaration.Name)
+		return unsupportedEntry(source.ID, declaration.Name, directory, invalidPackage("source identity does not match its declared source")), nil
 	}
 	packageRoot, err := confinedPath(source.Root, directory)
 	if err != nil {
-		return core.SkillCatalogEntry{}, fmt.Errorf("skill package %s/%s: %w", source.ID, declaration.Name, err)
+		return unsupportedEntry(source.ID, declaration.Name, directory, invalidPackage("package directory is invalid: %v", err)), nil
 	}
 	files := make([]sourceFile, 0, len(declaration.Files))
+	var bundleBytes int64
 	for _, relative := range declaration.Files {
 		path, err := confinedPath(packageRoot, filepath.FromSlash(relative))
 		if err != nil {
-			return core.SkillCatalogEntry{}, fmt.Errorf("skill package %s/%s file %q: %w", source.ID, declaration.Name, relative, err)
+			return unsupportedEntry(source.ID, declaration.Name, directory, invalidPackage("declared file %q is invalid: %v", relative, err)), nil
 		}
 		info, err := os.Lstat(path)
 		if err != nil {
+			if os.IsNotExist(err) {
+				return unsupportedEntry(source.ID, declaration.Name, directory, invalidPackage("declared file %q is missing", relative)), nil
+			}
 			return core.SkillCatalogEntry{}, fmt.Errorf("skill package %s/%s file %q: %w", source.ID, declaration.Name, relative, err)
 		}
 		if !info.Mode().IsRegular() {
-			return core.SkillCatalogEntry{}, fmt.Errorf("skill package %s/%s file %q is not a regular file", source.ID, declaration.Name, relative)
+			return unsupportedEntry(source.ID, declaration.Name, directory, invalidPackage("declared file %q is not a regular file", relative)), nil
+		}
+		if info.Mode()&0o111 != 0 {
+			return unsupportedEntry(source.ID, declaration.Name, directory, invalidPackage("declared file %q is executable content", relative)), nil
+		}
+		limit := int64(maxAssetBytes)
+		limitLabel := "1 MiB"
+		if relative == declaration.Instructions {
+			limit = maxInstructionsBytes
+			limitLabel = "256 KiB"
+		}
+		if info.Size() > limit {
+			return unsupportedEntry(source.ID, declaration.Name, directory, invalidPackage("declared file %q exceeds the %s limit", relative, limitLabel)), nil
+		}
+		bundleBytes += info.Size()
+		if bundleBytes > maxBundleBytes {
+			return unsupportedEntry(source.ID, declaration.Name, directory, invalidPackage("declared package content exceeds the 5 MiB bundle limit")), nil
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return core.SkillCatalogEntry{}, fmt.Errorf("read skill package %s/%s file %q: %w", source.ID, declaration.Name, relative, err)
+		}
+		if err := validateStaticFile(relative, declaration.Instructions, data); err != nil {
+			return unsupportedEntry(source.ID, declaration.Name, directory, err), nil
 		}
 		files = append(files, sourceFile{path: relative, data: data})
 	}
@@ -405,6 +567,46 @@ func (c *Catalog) loadPackage(source config.ResolvedSkillSource, directory strin
 	return core.SkillCatalogEntry{State: core.SkillReady, Package: pkg}, nil
 }
 
+func unsupportedEntry(sourceID, name, directory string, cause error) core.SkillCatalogEntry {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = filepath.Base(filepath.Clean(strings.TrimSpace(directory)))
+	}
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		name = "invalid-package"
+	}
+	diagnostic := strings.TrimSpace(cause.Error())
+	if len(diagnostic) > maxSkillDiagnosticBytes {
+		diagnostic = diagnostic[:maxSkillDiagnosticBytes]
+	}
+	return core.SkillCatalogEntry{
+		State: core.UnsupportedSkillPackage,
+		Package: core.SkillPackage{Identity: core.SkillPackageIdentity{
+			SourceID: strings.TrimSpace(sourceID),
+			Name:     name,
+		}},
+		Diagnostic: diagnostic,
+	}
+}
+
+func validateStaticFile(path, instructions string, data []byte) error {
+	extension := strings.ToLower(filepath.Ext(path))
+	if path == instructions && extension != ".md" && extension != ".markdown" {
+		return invalidPackage("instructions file %q must be Markdown", path)
+	}
+	switch extension {
+	case ".md", ".markdown", ".txt", ".json", ".yaml", ".yml", ".svg":
+		if !utf8.Valid(data) {
+			return invalidPackage("declared text file %q is not valid UTF-8", path)
+		}
+	case ".png", ".jpg", ".jpeg", ".gif":
+		// Static binary images are carried opaquely and never executed.
+	default:
+		return invalidPackage("declared file %q has a prohibited file type", path)
+	}
+	return nil
+}
+
 func staticMediaType(path string) string {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".md", ".markdown":
@@ -436,36 +638,57 @@ func normalizeDeclaration(declaration *packageDeclaration) error {
 	declaration.License = strings.TrimSpace(declaration.License)
 	declaration.SourceURL = strings.TrimSpace(declaration.SourceURL)
 	declaration.SourceRevision = strings.TrimSpace(declaration.SourceRevision)
-	declaration.Instructions = filepath.ToSlash(filepath.Clean(strings.TrimSpace(declaration.Instructions)))
+	var err error
+	declaration.Instructions, err = normalizeDeclaredPath(declaration.Instructions)
+	if err != nil {
+		return invalidPackage("instructions file is invalid: %v", err)
+	}
 	if declaration.SchemaVersion != core.SkillSchemaVersion {
-		return fmt.Errorf("schema_version must be %d", core.SkillSchemaVersion)
+		return invalidPackage("schema_version must be %d", core.SkillSchemaVersion)
 	}
 	if declaration.SourceID == "" || declaration.Name == "" || declaration.Description == "" || declaration.License == "" || declaration.SourceURL == "" || declaration.SourceRevision == "" {
-		return errors.New("source identity, name, description, license, source_url, and source_revision are required")
+		return invalidPackage("source identity, name, description, license, source_url, and source_revision are required")
 	}
-	if declaration.Instructions == "." || declaration.Instructions == "" {
-		return errors.New("instructions file is required")
+	if len(declaration.Files) > maxPackageFiles {
+		return invalidPackage("package declares %d files; at most 128 files are allowed", len(declaration.Files))
 	}
 	seen := make(map[string]struct{}, len(declaration.Files))
 	files := make([]string, 0, len(declaration.Files))
-	for _, file := range declaration.Files {
-		file = filepath.ToSlash(filepath.Clean(strings.TrimSpace(file)))
-		if file == "." || file == "" || strings.HasPrefix(file, "../") || filepath.IsAbs(file) {
-			return fmt.Errorf("declared file %q must be a package-relative path", file)
+	for _, rawFile := range declaration.Files {
+		file, pathErr := normalizeDeclaredPath(rawFile)
+		if pathErr != nil {
+			return invalidPackage("declared file %q must be a package-relative path: %v", rawFile, pathErr)
 		}
 		if _, exists := seen[file]; exists {
-			return fmt.Errorf("declared file %q is duplicated", file)
+			return invalidPackage("declared file %q is duplicated", file)
 		}
 		seen[file] = struct{}{}
 		files = append(files, file)
 	}
 	if _, ok := seen[declaration.Instructions]; !ok {
-		return errors.New("instructions file must be present in files")
+		return invalidPackage("instructions file must be present in files")
 	}
 	sort.Strings(files)
 	declaration.Files = files
 	sort.Strings(declaration.CompatibleRuntimes)
 	return nil
+}
+
+func normalizeDeclaredPath(value string) (string, error) {
+	raw := strings.TrimSpace(value)
+	if raw == "" || strings.Contains(raw, "\\") || strings.HasPrefix(raw, "/") || filepath.IsAbs(raw) || filepath.VolumeName(raw) != "" {
+		return "", errors.New("path must be a portable relative path")
+	}
+	parts := strings.Split(raw, "/")
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return "", errors.New("path traversal and empty segments are prohibited")
+		}
+	}
+	if len(parts)-1 > maxDirectoryDepth {
+		return "", errors.New("path exceeds eight directory levels")
+	}
+	return strings.Join(parts, "/"), nil
 }
 
 func hashPackage(declaration packageDeclaration, files []sourceFile) (string, error) {
@@ -684,9 +907,27 @@ func (c *Catalog) readStoredPackage(packageHash string) (core.SkillPackage, erro
 }
 
 func readStrictYAML(path string, destination any) error {
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("YAML input is not a regular file")
+	}
+	if info.Size() > maxManifestBytes {
+		return errors.New("YAML input exceeds the 256 KiB manifest or lock limit")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxManifestBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > maxManifestBytes {
+		return errors.New("YAML input exceeds the 256 KiB manifest or lock limit")
 	}
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)

@@ -25,8 +25,19 @@ packages:
     instructions: SKILL.md
     files: [SKILL.md]
     compatible_runtimes: [codex]
+  - source_id: source
+    name: broken
+    directory: broken
+    description: Uses a prohibited shell template
+    license: MIT
+    source_url: https://example.test/skills
+    source_revision: revision-1
+    instructions: SKILL.md
+    files: [SKILL.md, script.sh]
 `)
 		writeFile(t, repositoryRoot+"/skills/review/SKILL.md", "# Review\n")
+		writeFile(t, repositoryRoot+"/skills/broken/SKILL.md", "# Broken\n")
+		writeFile(t, repositoryRoot+"/skills/broken/script.sh", "#!/bin/sh\nexit 0\n")
 		settings := config.ResolvedSkills{
 			Enabled:     true,
 			RuntimeLock: repositoryRoot + "/.syntroph/skills.runtime.lock.yaml",
@@ -43,9 +54,10 @@ packages:
 			t.Fatal(err)
 		}
 		return skillcontracttest.SkillPortFixture{
-			Port:      catalog,
-			ReadyName: "source/review",
-			Runtime:   "codex",
+			Port:            catalog,
+			ReadyName:       "source/review",
+			UnsupportedName: "source/broken",
+			Runtime:         "codex",
 		}
 	})
 }

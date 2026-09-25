@@ -158,6 +158,67 @@ packages:
 	}
 }
 
+func TestSkillVerifyReturnsNonZeroWhenAnyPackageIsInvalid(t *testing.T) {
+	repositoryRoot := t.TempDir()
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "config.yaml"), `skills:
+  enabled: true
+  runtime_lock: .syntroph/skills.runtime.lock.yaml
+  sources:
+    - id: source
+      path: skills
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "skills.runtime.lock.yaml"), `schema_version: 1
+packages:
+  - source_id: source
+    name: review
+    directory: review
+    description: Review repository changes
+    license: MIT
+    source_url: https://example.test/skills
+    source_revision: revision-1
+    instructions: SKILL.md
+    files: [SKILL.md]
+    compatible_runtimes: [codex]
+  - source_id: source
+    name: diagnosing-bugs
+    directory: diagnosing-bugs
+    description: Diagnose bugs
+    license: MIT
+    source_url: https://example.test/skills
+    source_revision: revision-1
+    instructions: SKILL.md
+    files: [SKILL.md, scripts/hitl-loop.template.sh]
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, "skills", "review", "SKILL.md"), "# Review\n")
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, "skills", "diagnosing-bugs", "SKILL.md"), "# Diagnose\n")
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, "skills", "diagnosing-bugs", "scripts", "hitl-loop.template.sh"), "#!/bin/sh\nexit 0\n")
+
+	var out bytes.Buffer
+	if err := run([]string{"skill", "sync", "--root", repositoryRoot}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	if err := run([]string{"skill", "verify", "source/review", "--root", repositoryRoot}, &out, os.Stderr); err != nil {
+		t.Fatalf("verify of a Ready package failed: %v", err)
+	}
+	if !strings.Contains(out.String(), `"state": "Ready"`) {
+		t.Fatalf("skill verify output = %s", out.String())
+	}
+
+	out.Reset()
+	err := run([]string{"skill", "verify", "--root", repositoryRoot}, &out, os.Stderr)
+	if !errors.Is(err, core.ErrUnsupportedSkill) {
+		t.Fatalf("skill verify error = %v, want a non-zero ErrUnsupportedSkill result", err)
+	}
+	if !strings.Contains(out.String(), `"state": "Ready"`) || !strings.Contains(out.String(), `"state": "UnsupportedSkillPackage"`) {
+		t.Fatalf("skill verify output missing both catalog states: %s", out.String())
+	}
+	if strings.Contains(out.String(), repositoryRoot) {
+		t.Fatalf("skill verify output exposed an absolute host path: %s", out.String())
+	}
+}
+
 func TestSkillRecoveryInspectsStateAndRefusesToClearLiveOwner(t *testing.T) {
 	repositoryRoot := skillRecoveryCLIRepository(t)
 	owner := fmt.Sprintf(`{"schema_version":1,"pid":%d,"started_at":"2026-09-14T12:00:00Z","owner_id":"live-owner"}`, os.Getpid())

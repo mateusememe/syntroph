@@ -35,11 +35,11 @@ type skillPackageMetadata struct {
 
 func runSkill(args []string, out, errOut interface{ Write([]byte) (int, error) }) error {
 	if len(args) == 0 {
-		return errors.New("usage: syntroph skill <sync|list|show|recovery> [--root repository]")
+		return errors.New("usage: syntroph skill <sync|list|show|verify|recovery> [--root repository]")
 	}
 	command := args[0]
 	commandArgs := args[1:]
-	if command == "show" && len(commandArgs) > 0 && !strings.HasPrefix(commandArgs[0], "-") {
+	if (command == "show" || command == "verify") && len(commandArgs) > 0 && !strings.HasPrefix(commandArgs[0], "-") {
 		commandArgs = append(append([]string(nil), commandArgs[1:]...), commandArgs[0])
 	}
 	flags := flag.NewFlagSet("skill "+command, flag.ContinueOnError)
@@ -56,10 +56,14 @@ func runSkill(args []string, out, errOut interface{ Write([]byte) (int, error) }
 		if flags.NArg() != 1 {
 			return errors.New("syntroph skill show requires one qualified package name")
 		}
+	} else if command == "verify" {
+		if flags.NArg() > 1 {
+			return errors.New("syntroph skill verify accepts at most one qualified package name")
+		}
 	} else if flags.NArg() != 0 {
 		return fmt.Errorf("syntroph skill %s does not accept positional arguments", command)
 	}
-	if command != "sync" && command != "list" && command != "show" && command != "recovery" {
+	if command != "sync" && command != "list" && command != "show" && command != "verify" && command != "recovery" {
 		return fmt.Errorf("unknown skill command %q", command)
 	}
 
@@ -79,6 +83,9 @@ func runSkill(args []string, out, errOut interface{ Write([]byte) (int, error) }
 		return err
 	}
 	ctx := context.Background()
+	if command == "verify" {
+		return runSkillVerify(ctx, catalog, flags.Arg(0), out)
+	}
 	var value any
 	switch command {
 	case "sync":
@@ -116,4 +123,20 @@ func runSkill(args []string, out, errOut interface{ Write([]byte) (int, error) }
 	encoder := json.NewEncoder(out)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(value)
+}
+
+// runSkillVerify reports every requested catalog entry's verification
+// outcome before returning a non-zero result, so CI can both inspect what
+// was checked and detect failure from the exit code alone. name is empty
+// when the whole catalog should be verified.
+func runSkillVerify(ctx context.Context, catalog *skillfilesystem.Catalog, name string, out interface{ Write([]byte) (int, error) }) error {
+	entries, verifyErr := catalog.Verify(ctx, name)
+	if entries != nil {
+		encoder := json.NewEncoder(out)
+		encoder.SetIndent("", "  ")
+		if encodeErr := encoder.Encode(entries); encodeErr != nil {
+			return encodeErr
+		}
+	}
+	return verifyErr
 }
