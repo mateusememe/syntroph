@@ -372,16 +372,16 @@ func TestSessionCloseSkillInvocationRenderingNeverPromotesNestedObservations(t *
 	}
 }
 
-func TestSessionCloseCarriesNestedCodeReferencesAndArtifactsThroughUnresolved(t *testing.T) {
+// Nested code reference resolution and artifact verification (issue #27)
+// are covered by session_graph_artifacts_test.go. Without a configured
+// GraphPort, nested code references simply pass through unresolved.
+func TestSessionCloseCarriesNestedCodeReferencesThroughUnresolvedWithoutGraphPort(t *testing.T) {
 	_, bus := newTestSkillJournalBus(t)
 	closer := newTestSessionCloser(t, bus)
 
 	record := validSkillInvocationRecord()
 	record.InvocationID = "inv-opaque"
 	record.CodeReferences = []core.CodeReference{{Path: "core/skill.go", Symbol: "SkillPort"}}
-	record.Artifacts = []core.SkillInvocationArtifact{{
-		Path: "reports/review.md", SHA256: testOtherPackageHash, MediaType: "text/markdown", SizeBytes: 42,
-	}}
 
 	diary, err := closeWithSkillInvocations(t, closer, "sha-opaque", []core.SkillInvocationRecord{record})
 	if err != nil {
@@ -392,10 +392,7 @@ func TestSessionCloseCarriesNestedCodeReferencesAndArtifactsThroughUnresolved(t 
 		t.Fatalf("CodeReferences = %+v, want passed through unchanged", got.CodeReferences)
 	}
 	if got.CodeReferences[0].GraphSnapshotID != "" {
-		t.Fatalf("CodeReferences[0].GraphSnapshotID = %q, want unresolved (deferred to #27)", got.CodeReferences[0].GraphSnapshotID)
-	}
-	if len(got.Artifacts) != 1 || got.Artifacts[0].SHA256 != testOtherPackageHash || got.Artifacts[0].SizeBytes != 42 {
-		t.Fatalf("Artifacts = %+v, want passed through unchanged", got.Artifacts)
+		t.Fatalf("CodeReferences[0].GraphSnapshotID = %q, want unresolved without a configured GraphPort", got.CodeReferences[0].GraphSnapshotID)
 	}
 }
 
