@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -20,6 +21,19 @@ var (
 	ErrUnsupportedSkill           = errors.New("unsupported skill package")
 	ErrSkillInvocationReplay      = errors.New("skill invocation replay conflicts with the prepared bundle")
 	ErrSkillInvocationIDCollision = errors.New("generated skill invocation identity already exists")
+	// ErrSkillNameAmbiguous reports that an unqualified name matched more
+	// than one catalog package. Resolution never guesses at precedence -- a
+	// local package never silently overrides an external one -- so the
+	// caller must qualify the request with source_id/name instead.
+	ErrSkillNameAmbiguous = errors.New("skill package name is ambiguous; qualify it with source_id/name")
+	// ErrSkillAliasInvalid reports that an explicit alias does not resolve
+	// deterministically: its target is missing or itself ambiguous. Aliases
+	// never fall back to guessing, so this fails before preparation.
+	ErrSkillAliasInvalid = errors.New("skill alias does not resolve to exactly one known skill package")
+	// ErrSkillRuntimeIncompatible reports that the requested runtime is not
+	// declared compatible by the package. Runtime selection only validates
+	// compatibility; it never changes the canonical instructions.
+	ErrSkillRuntimeIncompatible = errors.New("requested runtime is not compatible with this skill package")
 )
 
 // SkillPackageIdentity identifies immutable source content independently from
@@ -115,6 +129,41 @@ func (b SkillBundle) Invocation() SkillInvocation {
 	}
 }
 
+// skillBundleView is the complete immutable JSON Skill Bundle emitted by
+// `syntroph skill prepare` and consumed by future RuntimePort adapters. It
+// carries only safe relative asset references into the content-addressed
+// store; it never contains a host filesystem path.
+type skillBundleView struct {
+	SchemaVersion      int                  `json:"schema_version"`
+	InvocationID       string               `json:"invocation_id"`
+	PackageIdentity    SkillPackageIdentity `json:"package_identity"`
+	Description        string               `json:"description,omitempty"`
+	Instructions       string               `json:"instructions"`
+	Assets             []SkillAsset         `json:"assets,omitempty"`
+	CompatibleRuntimes []string             `json:"compatible_runtimes,omitempty"`
+	Runtime            string               `json:"runtime,omitempty"`
+	Arguments          map[string]any       `json:"arguments,omitempty"`
+	BundleHash         string               `json:"bundle_hash"`
+}
+
+// MarshalJSON renders the complete immutable JSON Skill Bundle. SkillBundle
+// keeps its fields private everywhere else so a caller cannot mutate a
+// prepared bundle; this is the one place its shape is public.
+func (b SkillBundle) MarshalJSON() ([]byte, error) {
+	return json.Marshal(skillBundleView{
+		SchemaVersion:      b.schemaVersion,
+		InvocationID:       b.invocationID,
+		PackageIdentity:    b.identity,
+		Description:        b.description,
+		Instructions:       b.instructions,
+		Assets:             b.assets,
+		CompatibleRuntimes: b.runtimes,
+		Runtime:            b.runtime,
+		Arguments:          b.arguments,
+		BundleHash:         b.bundleHash,
+	})
+}
+
 type SkillPort interface {
 	Prepare(context.Context, SkillPrepareRequest) (SkillBundle, error)
 }
@@ -136,20 +185,29 @@ type InvocationIDFactory func() (string, error)
 // InMemorySkillPort is the deterministic Core adapter and contract reference
 // for catalog implementations. It performs no filesystem or runtime effects.
 type InMemorySkillPort struct {
-	mu      sync.Mutex
-	entries map[string]SkillCatalogEntry
-	byID    map[string]SkillBundle
-	newID   InvocationIDFactory
+	mu                sync.Mutex
+	entries           map[string]SkillCatalogEntry
+	byUnqualifiedName map[string][]string
+	aliases           map[string]string
+	byID              map[string]SkillBundle
+	newID             InvocationIDFactory
 }
 
-func NewInMemorySkillPort(entries []SkillCatalogEntry, newID InvocationIDFactory) (*InMemorySkillPort, error) {
+// NewInMemorySkillPort builds a deterministic catalog from entries, keyed by
+// their canonical source_id/name identity, plus an optional explicit alias
+// table. aliases is never consulted to resolve entries -- an alias target
+// must itself resolve through the canonical or unqualified path -- so
+// aliases cannot chain into further aliases.
+func NewInMemorySkillPort(entries []SkillCatalogEntry, aliases map[string]string, newID InvocationIDFactory) (*InMemorySkillPort, error) {
 	if newID == nil {
 		newID = randomInvocationID
 	}
 	p := &InMemorySkillPort{
-		entries: make(map[string]SkillCatalogEntry, len(entries)),
-		byID:    make(map[string]SkillBundle),
-		newID:   newID,
+		entries:           make(map[string]SkillCatalogEntry, len(entries)),
+		byUnqualifiedName: make(map[string][]string),
+		aliases:           cloneAliases(aliases),
+		byID:              make(map[string]SkillBundle),
+		newID:             newID,
 	}
 	for _, entry := range entries {
 		if err := validateSkillCatalogEntry(entry); err != nil {
@@ -160,6 +218,8 @@ func NewInMemorySkillPort(entries []SkillCatalogEntry, newID InvocationIDFactory
 			return nil, fmt.Errorf("duplicate skill package %q", name)
 		}
 		p.entries[name] = cloneSkillCatalogEntry(entry)
+		unqualified := entry.Package.Identity.Name
+		p.byUnqualifiedName[unqualified] = append(p.byUnqualifiedName[unqualified], name)
 	}
 	return p, nil
 }
@@ -172,12 +232,12 @@ func (p *InMemorySkillPort) Prepare(ctx context.Context, request SkillPrepareReq
 	if name == "" {
 		return SkillBundle{}, errors.New("skill package name is required")
 	}
-	entry, ok := p.entries[name]
-	if !ok {
-		return SkillBundle{}, fmt.Errorf("%w: %s", ErrSkillNotFound, name)
+	entry, err := p.resolveName(name)
+	if err != nil {
+		return SkillBundle{}, err
 	}
 	if entry.State != SkillReady {
-		return SkillBundle{}, fmt.Errorf("%w: %s: %s", ErrUnsupportedSkill, name, entry.Diagnostic)
+		return SkillBundle{}, fmt.Errorf("%w: %s: %s", ErrUnsupportedSkill, entry.Package.Identity.QualifiedName(), entry.Diagnostic)
 	}
 	invocationID := strings.TrimSpace(request.InvocationID)
 	explicitInvocationID := invocationID != ""
@@ -211,9 +271,58 @@ func (p *InMemorySkillPort) Prepare(ctx context.Context, request SkillPrepareReq
 	return bundle, nil
 }
 
+// resolveName finds the catalog entry a caller-supplied name identifies.
+// Canonical source_id/name identities always take precedence. An explicit
+// alias is consulted next, resolved through the canonical-or-unqualified
+// path only (never through another alias). Anything else is treated as an
+// unqualified package name and must match exactly one entry; a collision
+// requires qualification rather than guessing, so a local package can never
+// silently override an external one with the same name.
+func (p *InMemorySkillPort) resolveName(name string) (SkillCatalogEntry, error) {
+	if entry, ok := p.entries[name]; ok {
+		return entry, nil
+	}
+	if target, ok := p.aliases[name]; ok {
+		entry, err := p.resolvePackageName(target)
+		if err != nil {
+			return SkillCatalogEntry{}, fmt.Errorf("%w: alias %q targets %q: %v", ErrSkillAliasInvalid, name, target, err)
+		}
+		return entry, nil
+	}
+	return p.resolvePackageName(name)
+}
+
+func (p *InMemorySkillPort) resolvePackageName(name string) (SkillCatalogEntry, error) {
+	if entry, ok := p.entries[name]; ok {
+		return entry, nil
+	}
+	matches := p.byUnqualifiedName[name]
+	switch len(matches) {
+	case 0:
+		return SkillCatalogEntry{}, fmt.Errorf("%w: %s", ErrSkillNotFound, name)
+	case 1:
+		return p.entries[matches[0]], nil
+	default:
+		sorted := append([]string(nil), matches...)
+		sort.Strings(sorted)
+		return SkillCatalogEntry{}, fmt.Errorf("%w: %q matches %s", ErrSkillNameAmbiguous, name, strings.Join(sorted, ", "))
+	}
+}
+
 func newSkillBundle(invocationID string, pkg SkillPackage, runtime string, arguments map[string]any) (SkillBundle, error) {
+	runtime = strings.TrimSpace(runtime)
+	if err := validateSkillRuntimeCompatibility(pkg, runtime); err != nil {
+		return SkillBundle{}, err
+	}
 	normalizedArguments, err := normalizeSkillArguments(arguments)
 	if err != nil {
+		return SkillBundle{}, err
+	}
+	schema, err := parseSkillArgumentsSchema(pkg.ArgumentsSchema)
+	if err != nil {
+		return SkillBundle{}, err
+	}
+	if err := validateSkillArguments(schema, normalizedArguments); err != nil {
 		return SkillBundle{}, err
 	}
 	bundle := SkillBundle{
@@ -224,7 +333,7 @@ func newSkillBundle(invocationID string, pkg SkillPackage, runtime string, argum
 		instructions:  pkg.Instructions,
 		assets:        append([]SkillAsset(nil), pkg.Assets...),
 		runtimes:      append([]string(nil), pkg.CompatibleRuntimes...),
-		runtime:       strings.TrimSpace(runtime),
+		runtime:       runtime,
 		arguments:     normalizedArguments,
 	}
 	canonical := struct {
@@ -302,6 +411,33 @@ func cloneSkillCatalogEntry(entry SkillCatalogEntry) SkillCatalogEntry {
 	entry.Package.ArgumentsSchema = cloneSkillArguments(entry.Package.ArgumentsSchema)
 	entry.Package.CompatibleRuntimes = append([]string(nil), entry.Package.CompatibleRuntimes...)
 	return entry
+}
+
+// validateSkillRuntimeCompatibility validates runtime selection without
+// touching canonical instructions. An empty request runtime or a package
+// that declares no compatible runtimes places no restriction; otherwise the
+// requested runtime must be one of the package's declared runtimes.
+func validateSkillRuntimeCompatibility(pkg SkillPackage, runtime string) error {
+	if runtime == "" || len(pkg.CompatibleRuntimes) == 0 {
+		return nil
+	}
+	for _, compatible := range pkg.CompatibleRuntimes {
+		if compatible == runtime {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s does not support runtime %q (compatible: %s)", ErrSkillRuntimeIncompatible, pkg.Identity.QualifiedName(), runtime, strings.Join(pkg.CompatibleRuntimes, ", "))
+}
+
+func cloneAliases(aliases map[string]string) map[string]string {
+	if len(aliases) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(aliases))
+	for alias, target := range aliases {
+		cloned[strings.TrimSpace(alias)] = strings.TrimSpace(target)
+	}
+	return cloned
 }
 
 func cloneSkillArguments(arguments map[string]any) map[string]any {

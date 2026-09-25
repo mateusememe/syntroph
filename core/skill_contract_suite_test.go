@@ -23,7 +23,7 @@ func TestInMemorySkillPortContract(t *testing.T) {
 				}},
 				Diagnostic: "scripts are not supported before SandboxPort integration",
 			},
-		}, func() (string, error) {
+		}, nil, func() (string, error) {
 			generated++
 			return fmt.Sprintf("inv-generated-%d", generated), nil
 		})
@@ -54,7 +54,7 @@ func TestDeterministicRuntimePortContract(t *testing.T) {
 
 func prepareContractBundle(t *testing.T) core.SkillBundle {
 	t.Helper()
-	port, err := core.NewInMemorySkillPort([]core.SkillCatalogEntry{readySkillEntry()}, nil)
+	port, err := core.NewInMemorySkillPort([]core.SkillCatalogEntry{readySkillEntry()}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
