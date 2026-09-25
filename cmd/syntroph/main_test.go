@@ -417,6 +417,80 @@ func TestSkillPrepareWritesOutputFileAtomicallyWithPrivateMode(t *testing.T) {
 	}
 }
 
+func TestSkillPrepareJournalsPrepareRequestedAndPreparedEvents(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	var out bytes.Buffer
+	if err := run([]string{
+		"skill", "prepare", "source/code-review",
+		"--root", repositoryRoot,
+		"--invocation-id", "inv-cli-journal",
+		"--session", "session-cli",
+	}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	journal, err := core.NewSagaJournal(filepath.Join(repositoryRoot, ".syntroph", "journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := journal.ReadSaga(context.Background(), "inv-cli-journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eventTypes []string
+	for _, record := range records {
+		if record.Kind == "event" && record.Event != nil {
+			eventTypes = append(eventTypes, record.Event.Type)
+			if strings.Contains(string(record.Event.Payload), "Code Review") {
+				t.Fatalf("journaled skill event leaked instructions markdown: %s", record.Event.Payload)
+			}
+		}
+	}
+	want := []string{core.SkillEventPrepareRequested, core.SkillEventPrepared}
+	if len(eventTypes) != len(want) || eventTypes[0] != want[0] || eventTypes[1] != want[1] {
+		t.Fatalf("journaled event types = %v, want %v", eventTypes, want)
+	}
+}
+
+func TestSkillPrepareJournalsPrepareFailedEventOnFailure(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	var out bytes.Buffer
+	err := run([]string{
+		"skill", "prepare", "source/code-review",
+		"--root", repositoryRoot,
+		"--invocation-id", "inv-cli-journal-failure",
+		"--runtime", "antigravity",
+	}, &out, os.Stderr)
+	if err == nil {
+		t.Fatal("expected an error for an incompatible runtime")
+	}
+
+	journal, journalErr := core.NewSagaJournal(filepath.Join(repositoryRoot, ".syntroph", "journal"))
+	if journalErr != nil {
+		t.Fatal(journalErr)
+	}
+	records, readErr := journal.ReadSaga(context.Background(), "inv-cli-journal-failure")
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	var sawFailed bool
+	for _, record := range records {
+		if record.Kind == "event" && record.Event != nil && record.Event.Type == core.SkillEventPrepareFailed {
+			sawFailed = true
+			var payload core.SkillPrepareFailedPayload
+			if err := json.Unmarshal(record.Event.Payload, &payload); err != nil {
+				t.Fatalf("unmarshal prepare-failed payload: %v", err)
+			}
+			if payload.FailureClass != core.SkillPrepareFailureRuntimeIncompatible {
+				t.Fatalf("payload.FailureClass = %q, want %q", payload.FailureClass, core.SkillPrepareFailureRuntimeIncompatible)
+			}
+		}
+	}
+	if !sawFailed {
+		t.Fatalf("journal did not record a %s event for the failed prepare", core.SkillEventPrepareFailed)
+	}
+}
+
 func TestSkillPrepareFailsForAmbiguousUnqualifiedName(t *testing.T) {
 	repositoryRoot := t.TempDir()
 	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "config.yaml"), `skills:

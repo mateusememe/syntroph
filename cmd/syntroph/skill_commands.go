@@ -52,13 +52,15 @@ func runSkill(args []string, out, errOut interface{ Write([]byte) (int, error) }
 	if command == "recovery" {
 		clearOrphan = flags.Bool("clear-orphan", false, "clear synchronization state after process-liveness verification")
 	}
-	var prepareRuntime, prepareArguments, prepareArgumentsFile, prepareInvocationID, prepareOutput *string
+	var prepareRuntime, prepareArguments, prepareArgumentsFile, prepareInvocationID, prepareOutput, prepareRepository, prepareSession *string
 	if command == "prepare" {
 		prepareRuntime = flags.String("runtime", "", "runtime to validate compatibility against and record as a hint")
 		prepareArguments = flags.String("arguments", "", "skill arguments as a JSON object")
 		prepareArgumentsFile = flags.String("arguments-file", "", "path to a file containing skill arguments as a JSON object")
 		prepareInvocationID = flags.String("invocation-id", "", "explicit invocation id; repeating it replays the same bundle identity")
 		prepareOutput = flags.String("output", "", "write the prepared bundle atomically to this file with mode 0600 instead of stdout")
+		prepareRepository = flags.String("repository", "", "repository identity recorded on journaled skill events (defaults to the absolute --root path)")
+		prepareSession = flags.String("session", "", "optional runtime session identity used to correlate journaled skill events")
 	}
 	if err := flags.Parse(commandArgs); err != nil {
 		return err
@@ -98,12 +100,14 @@ func runSkill(args []string, out, errOut interface{ Write([]byte) (int, error) }
 		return runSkillVerify(ctx, catalog, flags.Arg(0), out)
 	}
 	if command == "prepare" {
-		return runSkillPrepare(ctx, catalog, flags.Arg(0), skillPrepareOptions{
+		return runSkillPrepare(ctx, catalog, *repositoryRoot, flags.Arg(0), skillPrepareOptions{
 			runtime:       *prepareRuntime,
 			arguments:     *prepareArguments,
 			argumentsFile: *prepareArgumentsFile,
 			invocationID:  *prepareInvocationID,
 			output:        *prepareOutput,
+			repository:    *prepareRepository,
+			session:       *prepareSession,
 		}, out)
 	}
 	var value any
@@ -169,6 +173,8 @@ type skillPrepareOptions struct {
 	argumentsFile string
 	invocationID  string
 	output        string
+	repository    string
+	session       string
 }
 
 // runSkillPrepare resolves name (a canonical qualified name, an explicit
@@ -177,7 +183,16 @@ type skillPrepareOptions struct {
 // by default, or atomically to opts.output with private mode 0600. It never
 // writes anywhere else, so a caller-selected output path is the only file
 // this command can create.
-func runSkillPrepare(ctx context.Context, catalog *skillfilesystem.Catalog, name string, opts skillPrepareOptions, out interface{ Write([]byte) (int, error) }) error {
+//
+// Preparation is journaled through core.SkillPreparer under
+// <repositoryRoot>/.syntroph/journal, the same Saga Journal directory used
+// by `syntroph sync` and `syntroph session close`. A prepare-requested event
+// is durable before Prepare runs, and a prepared or prepare-failed event
+// always follows, so the outcome is observable through the journal even
+// though this command does not expose a dedicated recovery surface for it:
+// a prepare failure is validation feedback, not a pending synchronization
+// obligation.
+func runSkillPrepare(ctx context.Context, catalog *skillfilesystem.Catalog, repositoryRoot, name string, opts skillPrepareOptions, out interface{ Write([]byte) (int, error) }) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return errors.New("syntroph skill prepare requires one qualified name, alias, or unique unqualified name")
@@ -189,11 +204,31 @@ func runSkillPrepare(ctx context.Context, catalog *skillfilesystem.Catalog, name
 	if err != nil {
 		return err
 	}
-	bundle, err := catalog.Prepare(ctx, core.SkillPrepareRequest{
+	repositoryID := strings.TrimSpace(opts.repository)
+	if repositoryID == "" {
+		absRoot, absErr := filepath.Abs(repositoryRoot)
+		if absErr != nil {
+			return fmt.Errorf("resolve repository identity: %w", absErr)
+		}
+		repositoryID = absRoot
+	}
+	journal, err := core.NewSagaJournal(filepath.Join(repositoryRoot, ".syntroph", "journal"))
+	if err != nil {
+		return err
+	}
+	bus, err := core.NewEventBus(journal)
+	if err != nil {
+		return err
+	}
+	preparer := core.SkillPreparer{Port: catalog, Bus: bus}
+	bundle, _, err := preparer.Prepare(ctx, core.SkillPrepareRequest{
 		Name:         name,
 		InvocationID: strings.TrimSpace(opts.invocationID),
 		Runtime:      strings.TrimSpace(opts.runtime),
 		Arguments:    arguments,
+	}, core.SkillPrepareOptions{
+		RepositoryID: repositoryID,
+		SessionID:    strings.TrimSpace(opts.session),
 	})
 	if err != nil {
 		return err
