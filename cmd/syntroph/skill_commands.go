@@ -42,6 +42,9 @@ func runSkill(args []string, out, errOut interface{ Write([]byte) (int, error) }
 	}
 	command := args[0]
 	commandArgs := args[1:]
+	// show/verify/prepare take a leading positional package name (e.g. `skill show source/name --root .`),
+	// but Go's flag package stops parsing flags at the first non-flag token. Rotate the
+	// positional argument to the end so flags.Parse below still sees every flag.
 	if (command == "show" || command == "verify" || command == "prepare") && len(commandArgs) > 0 && !strings.HasPrefix(commandArgs[0], "-") {
 		commandArgs = append(append([]string(nil), commandArgs[1:]...), commandArgs[0])
 	}

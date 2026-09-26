@@ -89,9 +89,17 @@ type SyncResult struct {
 }
 
 type Catalog struct {
-	mu                sync.Mutex
-	catalogRoot       string
-	settings          config.ResolvedSkills
+	mu          sync.Mutex
+	catalogRoot string
+	settings    config.ResolvedSkills
+	// preparer and preparerIndexHash cache the in-memory SkillPort built from
+	// the active index so repeated Prepare calls on one Catalog share
+	// invocation-replay tracking. This assumes the immutable store does not
+	// drift between two Prepare calls sharing an index hash within one
+	// process lifetime -- true for the CLI, which constructs a fresh Catalog
+	// per invocation. loadEntriesFromIndex still verifies store integrity on
+	// every cache miss, so a drifted store is rejected the first time a new
+	// process (or a new index) observes it.
 	preparer          core.SkillPort
 	preparerIndexHash string
 	checkpoint        func(SyncCheckpoint) error
@@ -416,6 +424,12 @@ func (c *Catalog) Prepare(ctx context.Context, request core.SkillPrepareRequest)
 	return c.preparer.Prepare(ctx, request)
 }
 
+// loadEntriesFromIndex materializes catalog entries for preparation. Unlike
+// Show and List, which trust the active index's recorded state, a Ready
+// entry here is re-verified against its immutable store content before it
+// can be prepared: preparation must reject a drifted store before returning
+// instructions, the same guarantee skill verify already provides, so a
+// tampered store object can never be silently prepared into a bundle.
 func (c *Catalog) loadEntriesFromIndex(ctx context.Context, index catalogIndex) ([]core.SkillCatalogEntry, error) {
 	entries := make([]core.SkillCatalogEntry, 0, len(index.Entries))
 	for _, summary := range index.Entries {
@@ -424,6 +438,17 @@ func (c *Catalog) loadEntriesFromIndex(ctx context.Context, index catalogIndex) 
 		}
 		entry := core.SkillCatalogEntry{State: summary.State, Diagnostic: summary.Diagnostic}
 		if summary.State == core.SkillReady {
+			if driftErr := c.verifyStoredPackageIntegrity(summary.Identity.PackageHash); driftErr != nil {
+				diagnostic := strings.TrimSpace(driftErr.Error())
+				if len(diagnostic) > maxSkillDiagnosticBytes {
+					diagnostic = diagnostic[:maxSkillDiagnosticBytes]
+				}
+				entry.State = core.UnsupportedSkillPackage
+				entry.Diagnostic = diagnostic
+				entry.Package.Identity = summary.Identity
+				entries = append(entries, entry)
+				continue
+			}
 			pkg, err := c.readStoredPackage(summary.Identity.PackageHash)
 			if err != nil {
 				return nil, err
@@ -944,6 +969,12 @@ func readStrictYAML(path string, destination any) error {
 	return nil
 }
 
+// confinedPath resolves relative against root and rejects any result
+// outside it, directly or through a symlink on an existing ancestor
+// (matching config.resolveRepositoryPath and core's resolveArtifactPath):
+// relative may itself be a source-declared package directory or file that
+// has not been Lstat-checked yet, so a symlinked ancestor could otherwise
+// smuggle a read outside the declared Skill Source or package directory.
 func confinedPath(root, relative string) (string, error) {
 	if strings.TrimSpace(relative) == "" || filepath.IsAbs(relative) {
 		return "", errors.New("path must be relative")
@@ -953,7 +984,45 @@ func confinedPath(root, relative string) (string, error) {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", errors.New("path escapes its declared skill source")
 	}
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve skill source root symlinks: %w", err)
+	}
+	canonicalResolved, err := evalPathWithExistingParent(resolved)
+	if err != nil {
+		return "", fmt.Errorf("resolve skill package path symlinks: %w", err)
+	}
+	canonicalRel, err := filepath.Rel(canonicalRoot, canonicalResolved)
+	if err != nil || canonicalRel == ".." || strings.HasPrefix(canonicalRel, ".."+string(filepath.Separator)) {
+		return "", errors.New("path escapes its declared skill source through a symlink")
+	}
 	return resolved, nil
+}
+
+// evalPathWithExistingParent resolves symlinks along path, walking up to
+// the nearest existing ancestor when the leaf does not exist yet, then
+// rejoins the missing segments onto the resolved ancestor.
+func evalPathWithExistingParent(path string) (string, error) {
+	candidate := path
+	var missing []string
+	for {
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return "", err
+		}
+		missing = append(missing, filepath.Base(candidate))
+		candidate = parent
+	}
 }
 
 func addUniqueEntry(entries *[]core.SkillCatalogEntry, seen map[string]struct{}, entry core.SkillCatalogEntry) error {
@@ -966,13 +1035,18 @@ func addUniqueEntry(entries *[]core.SkillCatalogEntry, seen map[string]struct{},
 	return nil
 }
 
+// cloneAliases trims alias and target names to match
+// core.cloneAliases's behavior at the same seam: this map is round-tripped
+// through the persisted catalog index and later passed to
+// core.NewInMemorySkillPort during preparation, so both copies must treat
+// whitespace the same way.
 func cloneAliases(aliases map[string]string) map[string]string {
 	if aliases == nil {
 		return nil
 	}
 	cloned := make(map[string]string, len(aliases))
 	for name, target := range aliases {
-		cloned[name] = target
+		cloned[strings.TrimSpace(name)] = strings.TrimSpace(target)
 	}
 	return cloned
 }
@@ -991,7 +1065,7 @@ func WritePrivateFile(path string, data []byte) error {
 }
 
 func writeAtomicMode(path string, data []byte, mode os.FileMode) error {
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".index-*")
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".atomic-write-*")
 	if err != nil {
 		return err
 	}

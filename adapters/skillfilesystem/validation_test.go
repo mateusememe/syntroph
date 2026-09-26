@@ -540,3 +540,65 @@ packages:
 		t.Fatalf("drift diagnostic exposed an absolute host path: %q", entries[0].Diagnostic)
 	}
 }
+
+func TestPrepareRejectsDriftedStoreBeforeReturningInstructions(t *testing.T) {
+	repositoryRoot := t.TempDir()
+	lockPath := filepath.Join(repositoryRoot, ".syntroph", "skills.runtime.lock.yaml")
+	writeFile(t, lockPath, `schema_version: 1
+packages:
+  - source_id: source
+    name: code-review
+    directory: code-review
+    description: Review changes
+    license: MIT
+    source_url: https://example.test/skills
+    source_revision: revision-1
+    instructions: SKILL.md
+    files: [SKILL.md, references/checklist.md]
+`)
+	writeFile(t, filepath.Join(repositoryRoot, "skills", "code-review", "SKILL.md"), "# Review\n")
+	writeFile(t, filepath.Join(repositoryRoot, "skills", "code-review", "references", "checklist.md"), "# Checklist\n")
+
+	settings := config.ResolvedSkills{
+		Enabled:     true,
+		RuntimeLock: lockPath,
+		Sources: []config.ResolvedSkillSource{
+			{ID: "local", Root: filepath.Join(repositoryRoot, ".syntroph", "skills")},
+			{ID: "source", Root: filepath.Join(repositoryRoot, "skills")},
+		},
+	}
+	catalog, err := skillfilesystem.New(repositoryRoot, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := catalog.Sync(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Entries) != 1 || result.Entries[0].State != core.SkillReady {
+		t.Fatalf("initial sync result = %+v", result)
+	}
+
+	if _, err := catalog.Prepare(context.Background(), core.SkillPrepareRequest{Name: "source/code-review"}); err != nil {
+		t.Fatalf("prepare before drift = %v", err)
+	}
+
+	// Tamper with the immutable store directly, simulating drift that a
+	// consistent Skill Source cannot itself produce.
+	packageHash := result.Entries[0].Identity.PackageHash
+	tamperedAsset := filepath.Join(repositoryRoot, ".syntroph", "catalog", "store", packageHash, "files", "references", "checklist.md")
+	if err := os.WriteFile(tamperedAsset, []byte("# Tampered\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh Catalog, matching a new `syntroph skill prepare` process, must
+	// observe the drift: Prepare's in-process cache only spans repeated
+	// calls on one Catalog instance sharing an index hash, never a new one.
+	freshCatalog, err := skillfilesystem.New(repositoryRoot, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := freshCatalog.Prepare(context.Background(), core.SkillPrepareRequest{Name: "source/code-review"}); !errors.Is(err, core.ErrUnsupportedSkill) {
+		t.Fatalf("prepare after drift error = %v, want ErrUnsupportedSkill", err)
+	}
+}
