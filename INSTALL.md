@@ -123,6 +123,24 @@ syntroph sync resolve <session-id> --keep-remote
 
 `sync recovery` shows the selected provider, remote identity and typed revision when known, the failure class, private conflict snapshot, and the next explicit action. Retry preserves the original Idempotency Key and provider. Conflict resolution displays the local/remote diff first: Issues append a correction comment for `--keep-local`, while Wiki writes an auditable commit; `--keep-remote` accepts the observed remote revision. Never change provider while recovering one operation.
 
+## Skill Catalog
+
+The Skill Catalog is a second, repository-scoped lock distinct from the root `skills-lock.json` development-tool lock. Its prerequisites are entirely local:
+
+- `.syntroph/config.yaml` with `skills.enabled: true` and at least one filesystem entry under `skills.sources` (each naming a `source_id` and a root directory already present on disk, such as the `.agents/skills` directory this repository vendors via `npx skills@latest add`).
+- `.syntroph/skills.runtime.lock.yaml` declaring every curated package under one of the configured sources: `source_id`, `name`, `directory`, `license`, `source_url`, `source_revision`, `instructions`, and the explicit `files` list. `syntroph skill sync` computes per-file and package SHA-256 hashes at sync time; it never fetches, installs, or executes anything.
+
+```sh
+syntroph skill sync
+syntroph skill list
+syntroph skill show <source/name>
+syntroph skill verify [<source/name>]
+syntroph skill prepare <source/name> --arguments '<json>' [--output <path>]
+syntroph skill recovery
+```
+
+`skill sync` reads only the files declared in the runtime lock from local disk, hashes them, and atomically publishes a verified index under `.syntroph/catalog/store/`; it makes no network calls, looks up no credentials, and invokes no installer. `skill list`/`show` report every declared package's state, including packages that fail static-asset validation: for example, the curated `diagnosing-bugs` package ships a `scripts/hitl-loop.template.sh` helper outside the Skill Package static-asset allow-list, so it syncs and remains visible as `UnsupportedSkillPackage` instead of `Ready`. `skill verify <source/name>` re-checks a synced package's declared files and hashes without preparing a runtime bundle, exiting non-zero (while still printing partial JSON) for any package that is not `Ready`. `skill prepare <source/name> --arguments '<json>'` resolves a `Ready` package into an immutable, runtime-neutral bundle and journals the attempt; it writes the bundle to stdout by default, or to a private file (mode `0600`) when `--output <path>` is given, since prepared bundles can embed caller-supplied arguments that should not land on a shared terminal or in CI logs. Preparing the same `--invocation-id` twice with unchanged inputs is a no-op replay; preparing it again with different inputs is rejected as a contradiction rather than silently producing a different bundle under the same identifier.
+
 ## Opt-in live GitHub smoke
 
 Normal `go test ./...` and pull-request CI are offline. The live smoke is behind the `livegithub` build tag and a manual `workflow_dispatch`; the workflow has no `pull_request` trigger and should use a protected `live-storage-smoke` environment. Run it only against a dedicated disposable repository, never a production tracker or Wiki.

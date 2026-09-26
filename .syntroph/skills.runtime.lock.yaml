@@ -1,0 +1,319 @@
+# Syntroph runtime Skill Catalog lock (.syntroph/skills.runtime.lock.yaml).
+#
+# This is SkillPort's own repository-scoped runtime lock (ADR 0027), read by
+# `syntroph skill sync` from local disk only. It is distinct from the
+# skills-lock.json at the repository root, which is an unrelated,
+# pre-existing lock consumed by an npx-based development-tool skill
+# installer that vendors .agents/skills/* into this repository in the first
+# place.
+#
+# Every package below is declared under source_id "mattpocock", resolved
+# against the "mattpocock" filesystem source configured in
+# .syntroph/config.yaml (skills.sources), which points at the .agents/skills
+# directory already committed to this repository. Sync performs no network
+# access, credential lookup, or installer invocation: it only reads the
+# files declared here from local disk and validates them.
+#
+# diagnosing-bugs is declared like every other package, with no
+# special-casing: its scripts/hitl-loop.template.sh file has a ".sh"
+# extension outside the Skill Package static-asset allow-list, so
+# `syntroph skill sync` classifies the whole package as an
+# UnsupportedSkillPackage automatically. The rest of the catalog is
+# unaffected.
+schema_version: 1
+packages:
+  - schema_version: 1
+    source_id: mattpocock
+    name: code-review
+    directory: code-review
+    description: >-
+      Review the diff since a fixed point (a commit, branch, tag, or
+      merge-base) along two axes: adherence to the repository's documented
+      coding standards, and fidelity to the originating issue or spec.
+      Both axes run as parallel sub-agents and report side by side.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+    arguments_schema:
+      type: object
+      properties:
+        fixed_point:
+          type: string
+      required:
+        - fixed_point
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: codebase-design
+    directory: codebase-design
+    description: >-
+      Shared vocabulary for designing deep modules. Use it to design or
+      improve a module's interface, find deepening opportunities, decide
+      where a seam belongs, or make code more testable and AI-navigable.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+      - DEEPENING.md
+      - DESIGN-IT-TWICE.md
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: diagnosing-bugs
+    directory: diagnosing-bugs
+    description: >-
+      Diagnosis loop for something broken, throwing, failing, or slow: read
+      CONTEXT.md and the relevant ADRs, then work the hypothesis loop while
+      redacting secrets from any captured command output. Ships alongside
+      a hitl-loop.template.sh helper script, which the Skill Package
+      static-asset allow-list rejects, so this package syncs as an
+      UnsupportedSkillPackage.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+      - scripts/hitl-loop.template.sh
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: domain-modeling
+    directory: domain-modeling
+    description: >-
+      Build and sharpen the project's domain model. Use it when discussing
+      codebase terminology, writing or editing CONTEXT.md, or recording an
+      ADR.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+      - ADR-FORMAT.md
+      - CONTEXT-FORMAT.md
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: grill-me
+    directory: grill-me
+    description: >-
+      Relentlessly interview the user to sharpen a plan or design, by
+      invoking the grilling skill.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: grill-with-docs
+    directory: grill-with-docs
+    description: >-
+      Relentlessly interview the user to sharpen a plan or design while
+      also producing supporting docs, such as an ADR or glossary entry, by
+      invoking grilling and domain-modeling in turn.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: grilling
+    directory: grilling
+    description: >-
+      Interview the user relentlessly about a plan, decision, or idea by
+      mapping the design tree and asking the frontier of ready questions
+      one round at a time until shared understanding is reached.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: implement
+    directory: implement
+    description: >-
+      Implement a piece of work described by a spec or a set of tickets,
+      favoring test-driven development, running the full test suite before
+      finishing, and requesting review before committing.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: implement-spec
+    directory: implement-spec
+    description: >-
+      Implement an entire specification, together with its associated
+      tickets, on a single branch by working the tickets' task graph and
+      keeping subagent communication sparse via context pointers.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: improve-codebase-architecture
+    directory: improve-codebase-architecture
+    description: >-
+      Scan the codebase for deepening opportunities informed by the
+      project's domain model, present them as a visual HTML report, and
+      grill through whichever opportunity is chosen.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+      - HTML-REPORT.md
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: research
+    directory: research
+    description: >-
+      Investigate a question against high-trust primary sources in a
+      background agent and capture the findings, with citations, in a
+      Markdown file in the repository.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: setup-matt-pocock-skills
+    directory: setup-matt-pocock-skills
+    description: >-
+      Configure a repository's engineering skills once, before first use,
+      by setting up its issue tracker, triage label vocabulary, and domain
+      doc layout.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+      - domain.md
+      - issue-tracker-github.md
+      - issue-tracker-gitlab.md
+      - issue-tracker-local.md
+      - triage-labels.md
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: tdd
+    directory: tdd
+    description: >-
+      Test-driven development: work the red-green-refactor loop, matching
+      test names to the project's domain vocabulary and respecting any
+      relevant ADRs.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+      - mocking.md
+      - tests.md
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: to-spec
+    directory: to-spec
+    description: >-
+      Turn the current conversation into a spec and publish it to the
+      project's issue tracker by synthesizing what has already been
+      discussed, without interviewing the user again.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: to-tickets
+    directory: to-tickets
+    description: >-
+      Break a plan, spec, or conversation into a set of tracer-bullet
+      tickets that declare their blocking edges, and publish them to the
+      configured issue tracker.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: triage
+    directory: triage
+    description: >-
+      Move issues, and pull requests treated as issues, through the
+      project's triage state machine: categorize, verify, grill if needed,
+      and write agent-ready briefs.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml
+      - AGENT-BRIEF.md
+      - OUT-OF-SCOPE.md
+
+  - schema_version: 1
+    source_id: mattpocock
+    name: wait-what
+    directory: wait-what
+    description: >-
+      Signal that the last message did not land and ask for it to be
+      re-pitched in simplified, unambiguous language.
+    license: MIT
+    source_url: https://github.com/mattpocock/skills
+    source_revision: main
+    instructions: SKILL.md
+    files:
+      - SKILL.md
+      - agents/openai.yaml

@@ -15,6 +15,7 @@ import (
 
 	"github.com/mateusememe/syntroph/adapters/githubissues"
 	"github.com/mateusememe/syntroph/adapters/githubwiki"
+	"github.com/mateusememe/syntroph/adapters/skillfilesystem"
 	"github.com/mateusememe/syntroph/adapters/storageadapter"
 	"github.com/mateusememe/syntroph/config"
 	"github.com/mateusememe/syntroph/core"
@@ -92,6 +93,471 @@ func TestSyncRetryRequiresExactlyOneScope(t *testing.T) {
 	}
 	if err := run([]string{"sync", "retry", "--graph"}, &out, os.Stderr); err != nil || !strings.Contains(out.String(), "graph synchronization") {
 		t.Fatalf("retry: %v %s", err, out.String())
+	}
+}
+
+func TestSkillSyncListAndShowUseRepositoryCatalog(t *testing.T) {
+	repositoryRoot := t.TempDir()
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "config.yaml"), `skills:
+  enabled: true
+  runtime_lock: .syntroph/skills.runtime.lock.yaml
+  sources:
+    - id: source
+      path: skills
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "skills.runtime.lock.yaml"), `schema_version: 1
+packages:
+  - source_id: source
+    name: review
+    directory: review
+    description: Review repository changes
+    license: MIT
+    source_url: https://example.test/skills
+    source_revision: revision-1
+    instructions: SKILL.md
+    files: [SKILL.md]
+    compatible_runtimes: [codex]
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, "skills", "review", "SKILL.md"), "# Review\n")
+
+	var out bytes.Buffer
+	if err := run([]string{"skill", "sync", "--root", repositoryRoot}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"state": "Ready"`, `"source_id": "source"`, `"name": "review"`} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("skill sync output missing %q: %s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), `"instructions":`) || strings.Contains(out.String(), "# Review") {
+		t.Fatalf("skill sync exposed full package content instead of its summary: %s", out.String())
+	}
+
+	out.Reset()
+	if err := run([]string{"skill", "list", "--root", repositoryRoot}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"package_hash"`) || !strings.Contains(out.String(), `"Ready"`) {
+		t.Fatalf("skill list output lacks catalog identity and state: %s", out.String())
+	}
+	if strings.Contains(out.String(), `"instructions"`) || strings.Contains(out.String(), "# Review") {
+		t.Fatalf("skill list exposed full package content instead of its summary: %s", out.String())
+	}
+
+	out.Reset()
+	if err := run([]string{"skill", "show", "source/review", "--root", repositoryRoot}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"license": "MIT"`, `"source_revision": "revision-1"`, `"instructions_path": "SKILL.md"`} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("skill show output missing %q: %s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), `"instructions":`) || strings.Contains(out.String(), "# Review") {
+		t.Fatalf("skill show exposed instruction content instead of auditable metadata: %s", out.String())
+	}
+}
+
+func TestSkillVerifyReturnsNonZeroWhenAnyPackageIsInvalid(t *testing.T) {
+	repositoryRoot := t.TempDir()
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "config.yaml"), `skills:
+  enabled: true
+  runtime_lock: .syntroph/skills.runtime.lock.yaml
+  sources:
+    - id: source
+      path: skills
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "skills.runtime.lock.yaml"), `schema_version: 1
+packages:
+  - source_id: source
+    name: review
+    directory: review
+    description: Review repository changes
+    license: MIT
+    source_url: https://example.test/skills
+    source_revision: revision-1
+    instructions: SKILL.md
+    files: [SKILL.md]
+    compatible_runtimes: [codex]
+  - source_id: source
+    name: diagnosing-bugs
+    directory: diagnosing-bugs
+    description: Diagnose bugs
+    license: MIT
+    source_url: https://example.test/skills
+    source_revision: revision-1
+    instructions: SKILL.md
+    files: [SKILL.md, scripts/hitl-loop.template.sh]
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, "skills", "review", "SKILL.md"), "# Review\n")
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, "skills", "diagnosing-bugs", "SKILL.md"), "# Diagnose\n")
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, "skills", "diagnosing-bugs", "scripts", "hitl-loop.template.sh"), "#!/bin/sh\nexit 0\n")
+
+	var out bytes.Buffer
+	if err := run([]string{"skill", "sync", "--root", repositoryRoot}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	if err := run([]string{"skill", "verify", "source/review", "--root", repositoryRoot}, &out, os.Stderr); err != nil {
+		t.Fatalf("verify of a Ready package failed: %v", err)
+	}
+	if !strings.Contains(out.String(), `"state": "Ready"`) {
+		t.Fatalf("skill verify output = %s", out.String())
+	}
+
+	out.Reset()
+	err := run([]string{"skill", "verify", "--root", repositoryRoot}, &out, os.Stderr)
+	if !errors.Is(err, core.ErrUnsupportedSkill) {
+		t.Fatalf("skill verify error = %v, want a non-zero ErrUnsupportedSkill result", err)
+	}
+	if !strings.Contains(out.String(), `"state": "Ready"`) || !strings.Contains(out.String(), `"state": "UnsupportedSkillPackage"`) {
+		t.Fatalf("skill verify output missing both catalog states: %s", out.String())
+	}
+	if strings.Contains(out.String(), repositoryRoot) {
+		t.Fatalf("skill verify output exposed an absolute host path: %s", out.String())
+	}
+}
+
+func TestSkillRecoveryInspectsStateAndRefusesToClearLiveOwner(t *testing.T) {
+	repositoryRoot := skillRecoveryCLIRepository(t)
+	owner := fmt.Sprintf(`{"schema_version":1,"pid":%d,"started_at":"2026-09-14T12:00:00Z","owner_id":"live-owner"}`, os.Getpid())
+	lockPath := filepath.Join(repositoryRoot, ".syntroph", "catalog", "sync.lock")
+	writeSkillCLIFile(t, lockPath, owner)
+	stagingPath := filepath.Join(repositoryRoot, ".syntroph", "catalog", "staging", "live-owner")
+	writeSkillCLIFile(t, filepath.Join(stagingPath, "owner.json"), owner)
+
+	var out bytes.Buffer
+	if err := run([]string{"skill", "recovery", "--root", repositoryRoot}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"state": "in_progress"`) || !strings.Contains(out.String(), `"owner_id": "live-owner"`) {
+		t.Fatalf("skill recovery output = %s", out.String())
+	}
+	out.Reset()
+	if err := run([]string{"skill", "recovery", "--clear-orphan", "--root", repositoryRoot}, &out, os.Stderr); !errors.Is(err, skillfilesystem.ErrSyncStillRunning) {
+		t.Fatalf("clear live recovery error = %v", err)
+	}
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("live lock was removed: %v", err)
+	}
+	if _, err := os.Stat(stagingPath); err != nil {
+		t.Fatalf("live staging was removed: %v", err)
+	}
+}
+
+func TestSkillRecoveryExplicitlyClearsDeadOwner(t *testing.T) {
+	process := exec.Command(os.Args[0], "-test.run=^$")
+	if err := process.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadPID := process.Process.Pid
+	if err := process.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	repositoryRoot := skillRecoveryCLIRepository(t)
+	owner := fmt.Sprintf(`{"schema_version":1,"pid":%d,"started_at":"2026-09-14T12:00:00Z","owner_id":"dead-owner"}`, deadPID)
+	lockPath := filepath.Join(repositoryRoot, ".syntroph", "catalog", "sync.lock")
+	writeSkillCLIFile(t, lockPath, owner)
+	stagingPath := filepath.Join(repositoryRoot, ".syntroph", "catalog", "staging", "dead-owner")
+	writeSkillCLIFile(t, filepath.Join(stagingPath, "owner.json"), owner)
+
+	var out bytes.Buffer
+	if err := run([]string{"skill", "recovery", "--clear-orphan", "--root", repositoryRoot}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"state": "none"`) {
+		t.Fatalf("skill recovery output = %s", out.String())
+	}
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("dead lock remains: %v", err)
+	}
+	if _, err := os.Stat(stagingPath); !os.IsNotExist(err) {
+		t.Fatalf("dead staging remains: %v", err)
+	}
+}
+
+func skillRecoveryCLIRepository(t *testing.T) string {
+	t.Helper()
+	repositoryRoot := t.TempDir()
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "config.yaml"), `skills:
+  enabled: true
+  runtime_lock: .syntroph/skills.runtime.lock.yaml
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "skills.runtime.lock.yaml"), "schema_version: 1\npackages: []\n")
+	return repositoryRoot
+}
+
+func writeSkillCLIFile(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func skillPrepareCLIRepository(t *testing.T) string {
+	t.Helper()
+	repositoryRoot := t.TempDir()
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "config.yaml"), `skills:
+  enabled: true
+  runtime_lock: .syntroph/skills.runtime.lock.yaml
+  sources:
+    - id: source
+      path: skills
+  aliases:
+    review: source/code-review
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "skills.runtime.lock.yaml"), `schema_version: 1
+packages:
+  - source_id: source
+    name: code-review
+    directory: code-review
+    description: Review repository changes
+    license: MIT
+    source_url: https://example.test/skills
+    source_revision: revision-1
+    instructions: SKILL.md
+    files: [SKILL.md]
+    compatible_runtimes: [codex]
+    arguments_schema:
+      type: object
+      properties:
+        fixed_point:
+          type: string
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, "skills", "code-review", "SKILL.md"), "# Code Review\n\nReview the supplied diff.\n")
+	var syncOut bytes.Buffer
+	if err := run([]string{"skill", "sync", "--root", repositoryRoot}, &syncOut, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	return repositoryRoot
+}
+
+func TestSkillPrepareWritesCompleteBundleJSONToStdout(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	var out bytes.Buffer
+	if err := run([]string{
+		"skill", "prepare", "source/code-review",
+		"--root", repositoryRoot,
+		"--invocation-id", "inv-cli-stdout",
+		"--runtime", "codex",
+		"--arguments", `{"fixed_point": "origin/main"}`,
+	}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	var bundle map[string]any
+	if err := json.Unmarshal(out.Bytes(), &bundle); err != nil {
+		t.Fatalf("skill prepare did not emit valid JSON: %v\n%s", err, out.String())
+	}
+	for _, want := range []string{`"invocation_id": "inv-cli-stdout"`, `"bundle_hash"`, `"instructions"`, `"runtime": "codex"`} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("skill prepare output missing %q: %s", want, out.String())
+		}
+	}
+}
+
+func TestSkillPrepareResolvesAliasFromConfiguredCatalog(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	var out bytes.Buffer
+	if err := run([]string{"skill", "prepare", "review", "--root", repositoryRoot, "--invocation-id", "inv-cli-alias"}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"name": "code-review"`) {
+		t.Fatalf("alias prepare did not resolve to the aliased package: %s", out.String())
+	}
+}
+
+func TestSkillPrepareReplayWithExplicitInvocationIDReproducesTheSameBundle(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	var first, second bytes.Buffer
+	args := []string{"skill", "prepare", "source/code-review", "--root", repositoryRoot, "--invocation-id", "inv-cli-replay"}
+	if err := run(args, &first, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(args, &second, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if first.String() != second.String() {
+		t.Fatalf("replay with explicit invocation id produced different bundles:\nfirst=%s\nsecond=%s", first.String(), second.String())
+	}
+}
+
+func TestSkillPrepareWritesOutputFileAtomicallyWithPrivateMode(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	outputPath := filepath.Join(t.TempDir(), "bundle.json")
+	var out bytes.Buffer
+	if err := run([]string{
+		"skill", "prepare", "source/code-review",
+		"--root", repositoryRoot,
+		"--invocation-id", "inv-cli-output",
+		"--output", outputPath,
+	}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("skill prepare wrote to stdout in addition to --output: %s", out.String())
+	}
+	info, err := os.Stat(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("prepared bundle file mode = %o, want 0600", perm)
+	}
+	contents, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bundle map[string]any
+	if err := json.Unmarshal(contents, &bundle); err != nil {
+		t.Fatalf("output file did not contain valid JSON: %v", err)
+	}
+}
+
+func TestSkillPrepareJournalsPrepareRequestedAndPreparedEvents(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	var out bytes.Buffer
+	if err := run([]string{
+		"skill", "prepare", "source/code-review",
+		"--root", repositoryRoot,
+		"--invocation-id", "inv-cli-journal",
+		"--session", "session-cli",
+	}, &out, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	journal, err := core.NewSagaJournal(filepath.Join(repositoryRoot, ".syntroph", "journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := journal.ReadSaga(context.Background(), "inv-cli-journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eventTypes []string
+	for _, record := range records {
+		if record.Kind == "event" && record.Event != nil {
+			eventTypes = append(eventTypes, record.Event.Type)
+			if strings.Contains(string(record.Event.Payload), "Code Review") {
+				t.Fatalf("journaled skill event leaked instructions markdown: %s", record.Event.Payload)
+			}
+		}
+	}
+	want := []string{core.SkillEventPrepareRequested, core.SkillEventPrepared}
+	if len(eventTypes) != len(want) || eventTypes[0] != want[0] || eventTypes[1] != want[1] {
+		t.Fatalf("journaled event types = %v, want %v", eventTypes, want)
+	}
+}
+
+func TestSkillPrepareJournalsPrepareFailedEventOnFailure(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	var out bytes.Buffer
+	err := run([]string{
+		"skill", "prepare", "source/code-review",
+		"--root", repositoryRoot,
+		"--invocation-id", "inv-cli-journal-failure",
+		"--runtime", "antigravity",
+	}, &out, os.Stderr)
+	if err == nil {
+		t.Fatal("expected an error for an incompatible runtime")
+	}
+
+	journal, journalErr := core.NewSagaJournal(filepath.Join(repositoryRoot, ".syntroph", "journal"))
+	if journalErr != nil {
+		t.Fatal(journalErr)
+	}
+	records, readErr := journal.ReadSaga(context.Background(), "inv-cli-journal-failure")
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	var sawFailed bool
+	for _, record := range records {
+		if record.Kind == "event" && record.Event != nil && record.Event.Type == core.SkillEventPrepareFailed {
+			sawFailed = true
+			var payload core.SkillPrepareFailedPayload
+			if err := json.Unmarshal(record.Event.Payload, &payload); err != nil {
+				t.Fatalf("unmarshal prepare-failed payload: %v", err)
+			}
+			if payload.FailureClass != core.SkillPrepareFailureRuntimeIncompatible {
+				t.Fatalf("payload.FailureClass = %q, want %q", payload.FailureClass, core.SkillPrepareFailureRuntimeIncompatible)
+			}
+		}
+	}
+	if !sawFailed {
+		t.Fatalf("journal did not record a %s event for the failed prepare", core.SkillEventPrepareFailed)
+	}
+}
+
+func TestSkillPrepareFailsForAmbiguousUnqualifiedName(t *testing.T) {
+	repositoryRoot := t.TempDir()
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "config.yaml"), `skills:
+  enabled: true
+  runtime_lock: .syntroph/skills.runtime.lock.yaml
+  sources:
+    - id: first
+      path: first
+    - id: second
+      path: second
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, ".syntroph", "skills.runtime.lock.yaml"), `schema_version: 1
+packages:
+  - source_id: first
+    name: review
+    directory: review
+    description: First review
+    license: MIT
+    source_url: https://example.test/first
+    source_revision: revision-1
+    instructions: SKILL.md
+    files: [SKILL.md]
+  - source_id: second
+    name: review
+    directory: review
+    description: Second review
+    license: MIT
+    source_url: https://example.test/second
+    source_revision: revision-1
+    instructions: SKILL.md
+    files: [SKILL.md]
+`)
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, "first", "review", "SKILL.md"), "# First\n")
+	writeSkillCLIFile(t, filepath.Join(repositoryRoot, "second", "review", "SKILL.md"), "# Second\n")
+	var syncOut bytes.Buffer
+	if err := run([]string{"skill", "sync", "--root", repositoryRoot}, &syncOut, os.Stderr); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err := run([]string{"skill", "prepare", "review", "--root", repositoryRoot}, &out, os.Stderr)
+	if err == nil {
+		t.Fatal("expected an error for an ambiguous unqualified skill name")
+	}
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous prepare error = %v, want it to mention ambiguity", err)
+	}
+}
+
+func TestSkillPrepareFailsWhenRuntimeIsIncompatible(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	var out bytes.Buffer
+	err := run([]string{"skill", "prepare", "source/code-review", "--root", repositoryRoot, "--runtime", "antigravity"}, &out, os.Stderr)
+	if err == nil {
+		t.Fatal("expected an error for an incompatible runtime")
+	}
+}
+
+func TestSkillPrepareFailsWhenArgumentsViolateTheDeclaredSchema(t *testing.T) {
+	repositoryRoot := skillPrepareCLIRepository(t)
+	var out bytes.Buffer
+	err := run([]string{
+		"skill", "prepare", "source/code-review",
+		"--root", repositoryRoot,
+		"--arguments", `{"undeclared_field": true}`,
+	}, &out, os.Stderr)
+	if err == nil {
+		t.Fatal("expected an error for undeclared skill arguments")
 	}
 }
 

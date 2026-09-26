@@ -1,0 +1,17 @@
+# Syntroph repository configuration (.syntroph/config.yaml).
+#
+# This file is distinct from the root skills-lock.json, which pins the
+# npx-based development-tool skill installer used to vendor
+# .agents/skills/* into this repository. skills-lock.json has no bearing on
+# SkillPort: it is consulted only by that unrelated installer.
+#
+# skills.runtime_lock below is SkillPort's own, repository-scoped Skill
+# Catalog lock (ADR 0027). It is read exclusively from local disk: no
+# network access, credential lookup, or installer invocation ever occurs
+# while resolving it.
+skills:
+  enabled: true
+  runtime_lock: .syntroph/skills.runtime.lock.yaml
+  sources:
+    - id: mattpocock
+      path: .agents/skills
