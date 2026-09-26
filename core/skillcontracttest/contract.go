@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -18,6 +19,13 @@ type SkillPortFixture struct {
 	ReadyName       string
 	UnsupportedName string
 	Runtime         string
+	// AmbiguousName is an unqualified name matched by two or more catalog
+	// entries, proving Prepare rejects it instead of silently picking one.
+	// Optional: the ambiguity subtest skips when this is empty.
+	AmbiguousName string
+	// AliasName resolves, through the fixture's configured aliases, to
+	// ReadyName. Optional: the alias subtest skips when this is empty.
+	AliasName string
 }
 
 type SkillPortFactory func(*testing.T) SkillPortFixture
@@ -95,6 +103,111 @@ func RunSkillPort(t *testing.T, name string, factory SkillPortFactory) {
 		}
 		if _, err := fixture.Port.Prepare(context.Background(), core.SkillPrepareRequest{Name: fixture.ReadyName, InvocationID: "inv-after-unsupported"}); err != nil {
 			t.Fatalf("unsupported package invalidated the ready catalog: %v", err)
+		}
+	})
+
+	t.Run(name+"/deterministic_identities", func(t *testing.T) {
+		left := factory(t)
+		right := factory(t)
+		validateSkillPortFixture(t, left)
+		validateSkillPortFixture(t, right)
+		leftBundle, err := left.Port.Prepare(context.Background(), core.SkillPrepareRequest{Name: left.ReadyName, InvocationID: "inv-contract-identity-left", Runtime: left.Runtime})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rightBundle, err := right.Port.Prepare(context.Background(), core.SkillPrepareRequest{Name: right.ReadyName, InvocationID: "inv-contract-identity-right", Runtime: right.Runtime})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if leftBundle.PackageIdentity() != rightBundle.PackageIdentity() {
+			t.Fatalf("independently constructed catalogs disagree on package identity: left=%+v right=%+v", leftBundle.PackageIdentity(), rightBundle.PackageIdentity())
+		}
+		if leftBundle.BundleHash() != rightBundle.BundleHash() {
+			t.Fatalf("independently constructed catalogs disagree on bundle hash: left=%q right=%q", leftBundle.BundleHash(), rightBundle.BundleHash())
+		}
+	})
+
+	t.Run(name+"/unique_unqualified_name_resolves", func(t *testing.T) {
+		fixture := factory(t)
+		validateSkillPortFixture(t, fixture)
+		segments := strings.SplitN(fixture.ReadyName, "/", 2)
+		if len(segments) != 2 {
+			t.Fatalf("ReadyName %q is not a qualified source_id/name identity", fixture.ReadyName)
+		}
+		unqualified := segments[1]
+		qualified, err := fixture.Port.Prepare(context.Background(), core.SkillPrepareRequest{Name: fixture.ReadyName, InvocationID: "inv-contract-qualified", Runtime: fixture.Runtime})
+		if err != nil {
+			t.Fatal(err)
+		}
+		byUnqualified, err := fixture.Port.Prepare(context.Background(), core.SkillPrepareRequest{Name: unqualified, InvocationID: "inv-contract-unqualified", Runtime: fixture.Runtime})
+		if err != nil {
+			t.Fatalf("unique unqualified name %q did not resolve: %v", unqualified, err)
+		}
+		if qualified.PackageIdentity() != byUnqualified.PackageIdentity() {
+			t.Fatalf("unqualified resolution disagreed with qualified: qualified=%+v unqualified=%+v", qualified.PackageIdentity(), byUnqualified.PackageIdentity())
+		}
+	})
+
+	t.Run(name+"/ambiguous_unqualified_name_is_rejected", func(t *testing.T) {
+		fixture := factory(t)
+		if fixture.AmbiguousName == "" {
+			return
+		}
+		validateSkillPortFixture(t, fixture)
+		if _, err := fixture.Port.Prepare(context.Background(), core.SkillPrepareRequest{Name: fixture.AmbiguousName}); !errors.Is(err, core.ErrSkillNameAmbiguous) {
+			t.Fatalf("ambiguous name error = %v, want ErrSkillNameAmbiguous", err)
+		}
+	})
+
+	t.Run(name+"/alias_resolves_to_target", func(t *testing.T) {
+		fixture := factory(t)
+		if fixture.AliasName == "" {
+			return
+		}
+		validateSkillPortFixture(t, fixture)
+		target, err := fixture.Port.Prepare(context.Background(), core.SkillPrepareRequest{Name: fixture.ReadyName, InvocationID: "inv-contract-alias-target", Runtime: fixture.Runtime})
+		if err != nil {
+			t.Fatal(err)
+		}
+		byAlias, err := fixture.Port.Prepare(context.Background(), core.SkillPrepareRequest{Name: fixture.AliasName, InvocationID: "inv-contract-alias", Runtime: fixture.Runtime})
+		if err != nil {
+			t.Fatalf("alias %q did not resolve: %v", fixture.AliasName, err)
+		}
+		if target.PackageIdentity() != byAlias.PackageIdentity() {
+			t.Fatalf("alias resolution disagreed with its target: target=%+v alias=%+v", target.PackageIdentity(), byAlias.PackageIdentity())
+		}
+	})
+
+	t.Run(name+"/incompatible_runtime_is_rejected", func(t *testing.T) {
+		fixture := factory(t)
+		validateSkillPortFixture(t, fixture)
+		baseline, err := fixture.Port.Prepare(context.Background(), core.SkillPrepareRequest{Name: fixture.ReadyName, InvocationID: "inv-contract-runtime-baseline", Runtime: fixture.Runtime})
+		if err != nil {
+			t.Fatal(err)
+		}
+		compatible := baseline.CompatibleRuntimes()
+		if len(compatible) == 0 {
+			// The Ready package accepts any runtime; incompatibility has
+			// nothing to assert for this fixture.
+			return
+		}
+		const incompatibleRuntime = "syntroph-contract-incompatible-runtime"
+		for _, runtime := range compatible {
+			if runtime == incompatibleRuntime {
+				t.Fatalf("fixture's compatible runtimes unexpectedly include the contract's incompatible probe %q", incompatibleRuntime)
+			}
+		}
+		if _, err := fixture.Port.Prepare(context.Background(), core.SkillPrepareRequest{Name: fixture.ReadyName, Runtime: incompatibleRuntime}); !errors.Is(err, core.ErrSkillRuntimeIncompatible) {
+			t.Fatalf("incompatible runtime error = %v, want ErrSkillRuntimeIncompatible", err)
+		}
+	})
+
+	t.Run(name+"/invalid_arguments_are_rejected", func(t *testing.T) {
+		fixture := factory(t)
+		validateSkillPortFixture(t, fixture)
+		arguments := map[string]any{"__contract_test_undeclared_field__": true}
+		if _, err := fixture.Port.Prepare(context.Background(), core.SkillPrepareRequest{Name: fixture.ReadyName, Runtime: fixture.Runtime, Arguments: arguments}); !errors.Is(err, core.ErrSkillArgumentsInvalid) {
+			t.Fatalf("invalid arguments error = %v, want ErrSkillArgumentsInvalid", err)
 		}
 	})
 }

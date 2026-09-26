@@ -23,7 +23,23 @@ func TestInMemorySkillPortContract(t *testing.T) {
 				}},
 				Diagnostic: "scripts are not supported before SandboxPort integration",
 			},
-		}, nil, func() (string, error) {
+			{
+				State: core.UnsupportedSkillPackage,
+				Package: core.SkillPackage{Identity: core.SkillPackageIdentity{
+					SourceID: "alpha",
+					Name:     "shared",
+				}},
+				Diagnostic: "contract ambiguity fixture",
+			},
+			{
+				State: core.UnsupportedSkillPackage,
+				Package: core.SkillPackage{Identity: core.SkillPackageIdentity{
+					SourceID: "beta",
+					Name:     "shared",
+				}},
+				Diagnostic: "contract ambiguity fixture",
+			},
+		}, map[string]string{"cr": "mattpocock/code-review"}, func() (string, error) {
 			generated++
 			return fmt.Sprintf("inv-generated-%d", generated), nil
 		})
@@ -35,6 +51,8 @@ func TestInMemorySkillPortContract(t *testing.T) {
 			ReadyName:       "mattpocock/code-review",
 			UnsupportedName: "mattpocock/diagnosing-bugs",
 			Runtime:         "codex",
+			AmbiguousName:   "shared",
+			AliasName:       "cr",
 		}
 	})
 }

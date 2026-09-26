@@ -39,10 +39,29 @@ packages:
     source_revision: revision-1
     instructions: SKILL.md
     files: [SKILL.md, script.sh]
+  - source_id: source
+    name: shared
+    directory: shared
+    description: Contract ambiguity fixture (source)
+    license: MIT
+    source_url: https://example.test/skills
+    source_revision: revision-1
+    instructions: SKILL.md
+    files: [SKILL.md]
 `)
 		writeFile(t, repositoryRoot+"/skills/review/SKILL.md", "# Review\n")
 		writeFile(t, repositoryRoot+"/skills/broken/SKILL.md", "# Broken\n")
 		writeFile(t, repositoryRoot+"/skills/broken/script.sh", "#!/bin/sh\nexit 0\n")
+		writeFile(t, repositoryRoot+"/skills/shared/SKILL.md", "# Shared (source)\n")
+		writeFile(t, repositoryRoot+"/.syntroph/skills/shared/skill.yaml", `name: shared
+description: Contract ambiguity fixture (local)
+license: MIT
+source_url: https://example.test/local
+source_revision: revision-1
+instructions: SKILL.md
+files: [SKILL.md]
+`)
+		writeFile(t, repositoryRoot+"/.syntroph/skills/shared/SKILL.md", "# Shared (local)\n")
 		settings := config.ResolvedSkills{
 			Enabled:     true,
 			RuntimeLock: repositoryRoot + "/.syntroph/skills.runtime.lock.yaml",
@@ -50,6 +69,7 @@ packages:
 				{ID: "local", Root: repositoryRoot + "/.syntroph/skills"},
 				{ID: "source", Root: repositoryRoot + "/skills"},
 			},
+			Aliases: map[string]string{"cr": "source/review"},
 		}
 		catalog, err := skillfilesystem.New(repositoryRoot, settings)
 		if err != nil {
@@ -63,6 +83,8 @@ packages:
 			ReadyName:       "source/review",
 			UnsupportedName: "source/broken",
 			Runtime:         "codex",
+			AmbiguousName:   "shared",
+			AliasName:       "cr",
 		}
 	})
 }
