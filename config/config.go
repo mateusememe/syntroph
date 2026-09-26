@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -27,6 +28,31 @@ const (
 type Config struct {
 	GraphifyExecutable string         `yaml:"graphify_executable,omitempty"`
 	Storage            *StorageConfig `yaml:"storage,omitempty"`
+	Skills             *SkillsConfig  `yaml:"skills,omitempty"`
+}
+
+type SkillsConfig struct {
+	Enabled     bool                `yaml:"enabled"`
+	RuntimeLock string              `yaml:"runtime_lock,omitempty"`
+	Sources     []SkillSourceConfig `yaml:"sources,omitempty"`
+	Aliases     map[string]string   `yaml:"aliases,omitempty"`
+}
+
+type SkillSourceConfig struct {
+	ID   string `yaml:"id"`
+	Path string `yaml:"path"`
+}
+
+type ResolvedSkillSource struct {
+	ID   string
+	Root string
+}
+
+type ResolvedSkills struct {
+	Enabled     bool
+	RuntimeLock string
+	Sources     []ResolvedSkillSource
+	Aliases     map[string]string
 }
 
 type StorageConfig struct {
@@ -153,6 +179,107 @@ func (c Config) ResolveStorage(origin string) (ResolvedStorage, error) {
 		CrossRepository: cross, AllowCrossRepository: s.AllowCrossRepository,
 		MCP: s.MCP, Wiki: s.Wiki,
 	}, nil
+}
+
+// ResolveSkills confines every configured input to one Repository
+// Installation and adds the implicit repository-authored local source.
+func (c Config) ResolveSkills(repositoryRoot string) (ResolvedSkills, error) {
+	if c.Skills == nil || !c.Skills.Enabled {
+		return ResolvedSkills{}, nil
+	}
+	root, err := filepath.Abs(repositoryRoot)
+	if err != nil {
+		return ResolvedSkills{}, fmt.Errorf("resolve repository root: %w", err)
+	}
+	lock, err := resolveRepositoryPath(root, c.Skills.RuntimeLock, "skills.runtime_lock")
+	if err != nil {
+		return ResolvedSkills{}, err
+	}
+	localRoot, err := resolveRepositoryPath(root, filepath.Join(".syntroph", "skills"), "implicit local skill source")
+	if err != nil {
+		return ResolvedSkills{}, err
+	}
+	resolved := ResolvedSkills{
+		Enabled:     true,
+		RuntimeLock: lock,
+		Sources:     []ResolvedSkillSource{{ID: "local", Root: localRoot}},
+		Aliases:     make(map[string]string, len(c.Skills.Aliases)),
+	}
+	seen := map[string]struct{}{"local": {}}
+	for _, source := range c.Skills.Sources {
+		id := strings.TrimSpace(source.ID)
+		if id == "" || id != source.ID {
+			return ResolvedSkills{}, errors.New("skill source id is required and must not contain surrounding whitespace")
+		}
+		if _, exists := seen[id]; exists {
+			return ResolvedSkills{}, fmt.Errorf("duplicate skill source id %q", id)
+		}
+		sourceRoot, err := resolveRepositoryPath(root, source.Path, "skill source "+id)
+		if err != nil {
+			return ResolvedSkills{}, err
+		}
+		seen[id] = struct{}{}
+		resolved.Sources = append(resolved.Sources, ResolvedSkillSource{ID: id, Root: sourceRoot})
+	}
+	for alias, target := range c.Skills.Aliases {
+		alias, target = strings.TrimSpace(alias), strings.TrimSpace(target)
+		if alias == "" || target == "" {
+			return ResolvedSkills{}, errors.New("skill aliases require non-empty names and targets")
+		}
+		resolved.Aliases[alias] = target
+	}
+	return resolved, nil
+}
+
+func resolveRepositoryPath(repositoryRoot, value, field string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("%s is required when skills are enabled", field)
+	}
+	if filepath.IsAbs(value) {
+		return "", fmt.Errorf("%s must be relative to the Repository Installation", field)
+	}
+	resolved := filepath.Clean(filepath.Join(repositoryRoot, value))
+	relative, err := filepath.Rel(repositoryRoot, resolved)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%s escapes the Repository Installation", field)
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(repositoryRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve Repository Installation symlinks: %w", err)
+	}
+	canonicalResolved, err := evalPathWithExistingParent(resolved)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s symlinks: %w", field, err)
+	}
+	canonicalRelative, err := filepath.Rel(canonicalRoot, canonicalResolved)
+	if err != nil || canonicalRelative == ".." || strings.HasPrefix(canonicalRelative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%s escapes the Repository Installation through a symlink", field)
+	}
+	return resolved, nil
+}
+
+func evalPathWithExistingParent(path string) (string, error) {
+	candidate := path
+	var missing []string
+	for {
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return "", err
+		}
+		missing = append(missing, filepath.Base(candidate))
+		candidate = parent
+	}
 }
 
 // NormalizeGitHubRepository converts GitHub HTTPS, SSH, SCP-style, and
