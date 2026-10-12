@@ -452,9 +452,9 @@ func resolve(args []string, out interface{ Write([]byte) (int, error) }) error {
 		fmt.Fprintln(out, "Resolution recorded: keep-remote.")
 		return nil
 	}
-	if err := os.WriteFile(*remote, lb, 0o644); err != nil {
-		return err
-	}
+	// Mirrors the configured-adapter path above: a keep-local choice is
+	// recorded, never an overwrite of the file the operator pointed
+	// --remote-file at.
 	fmt.Fprintln(out, "Resolution recorded: keep-local.")
 	return nil
 }
