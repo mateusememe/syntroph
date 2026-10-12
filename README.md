@@ -33,9 +33,21 @@ syntroph sync status
 syntroph sync recovery
 syntroph sync retry --graph
 syntroph sync resolve <id> --keep-local
+syntroph skill sync
+syntroph skill list
+syntroph skill show <source/name>
+syntroph skill verify [<source/name>]
+syntroph skill prepare <source/name> --arguments '<json>' [--output <path>]
+syntroph skill recovery
 ```
 
 Session artifacts are structured Markdown or JSON. A manual `--summary` fallback is supported; raw transcript capture is outside the MVP.
+
+Skill Catalog synchronization is explicit, offline, and installation-scoped. It keeps immutable package objects under `.syntroph/catalog/store/` and atomically publishes only a completely verified index. A concurrent writer reports `in_progress`; an interrupted writer requires inspection with `syntroph skill recovery` and explicit cleanup with `syntroph skill recovery --clear-orphan`. Cleanup first verifies that the recorded process is dead and never deletes historical package objects.
+
+`skill sync`/`list`/`show`/`verify`/`prepare` are entirely local and offline: prerequisites are a `.syntroph/config.yaml` with `skills.enabled: true` and at least one filesystem entry under `skills.sources`, plus a repository-scoped `.syntroph/skills.runtime.lock.yaml` declaring each curated package's files, license, source URL, source revision, and per-file/package hashes. Sync never performs network access, credential lookup, or installer invocation; it only reads the declared files from local disk and validates them against the lock. `skill verify <source/name>` re-checks a synced package without preparing a runtime bundle, printing partial JSON and exiting non-zero if the package is not `Ready`. `skill prepare <source/name> --arguments '<json>'` resolves a `Ready` package into an immutable, runtime-neutral bundle; by default the bundle is written to stdout, but `--output <path>` writes it to a private file (mode `0600`) instead, so bundles carrying caller-supplied arguments are not exposed on shared terminals or in CI logs. Preparing the same `--invocation-id` twice with identical inputs is a no-op replay; preparing it again with different inputs is rejected as a contradiction instead of silently overwriting the prior bundle.
+
+Packages that fail static-asset validation stay visible rather than being silently dropped: `diagnosing-bugs` ships a `scripts/hitl-loop.template.sh` helper outside the Skill Package static-asset allow-list, so it still appears in `skill list`/`skill show` but is classified `UnsupportedSkillPackage`, and both `skill verify` and `skill prepare` reject it with a diagnostic instead of running it.
 
 Repository configuration uses `.syntroph/config.yaml` exclusively. Run `syntroph doctor storage` after cloning to validate the selected provider, normalized destination, and local prerequisites without authenticating or writing remotely. See [Installation](INSTALL.md#github-mirroring) for safe examples.
 

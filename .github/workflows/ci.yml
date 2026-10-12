@@ -17,5 +17,14 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: go test ./...
+      - name: gofmt
+        run: |
+          fmt_files="$(gofmt -l .)"
+          if [ -n "$fmt_files" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$fmt_files"
+            exit 1
+          fi
+      - run: go build ./...
       - run: go vet ./...
+      - run: go test ./... -race

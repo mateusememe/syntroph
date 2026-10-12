@@ -27,13 +27,20 @@ type CodeReference struct {
 }
 
 // SessionArtifact is the runtime-neutral input to session close.
+//
+// SkillInvocations carries portable Skill Invocation Records (ADR 0028).
+// JSON Session Artifacts accept them directly under skill_invocations;
+// Markdown Session Artifacts accept exactly one strict JSON array block
+// under a "Skill Invocations" heading. Session close reconciles each
+// record against local Saga Journal evidence before it reaches the diary.
 type SessionArtifact struct {
-	Title          string          `json:"title"`
-	Summary        string          `json:"summary"`
-	Decisions      []string        `json:"decisions,omitempty"`
-	Lessons        []string        `json:"lessons,omitempty"`
-	CodeReferences []CodeReference `json:"code_references,omitempty"`
-	Related        []string        `json:"related,omitempty"`
+	Title            string                  `json:"title"`
+	Summary          string                  `json:"summary"`
+	Decisions        []string                `json:"decisions,omitempty"`
+	Lessons          []string                `json:"lessons,omitempty"`
+	CodeReferences   []CodeReference         `json:"code_references,omitempty"`
+	Related          []string                `json:"related,omitempty"`
+	SkillInvocations []SkillInvocationRecord `json:"skill_invocations,omitempty"`
 }
 
 type ArtifactFormat string
@@ -79,12 +86,24 @@ func validateArtifact(a SessionArtifact) (SessionArtifact, error) {
 			return SessionArtifact{}, errors.New("code reference path is required")
 		}
 	}
+	for i := range a.SkillInvocations {
+		validated, err := validateSkillInvocationRecord(a.SkillInvocations[i])
+		if err != nil {
+			return SessionArtifact{}, err
+		}
+		a.SkillInvocations[i] = validated
+	}
 	return a, nil
 }
 
 func parseMarkdownArtifact(markdown string) (SessionArtifact, error) {
-	a := SessionArtifact{}
-	lines := strings.Split(strings.ReplaceAll(markdown, "\r\n", "\n"), "\n")
+	normalized := strings.ReplaceAll(markdown, "\r\n", "\n")
+	skillInvocations, remainder, err := extractSkillInvocationsSection(normalized)
+	if err != nil {
+		return SessionArtifact{}, err
+	}
+	a := SessionArtifact{SkillInvocations: skillInvocations}
+	lines := strings.Split(remainder, "\n")
 	section := "summary"
 	var body []string
 	for _, line := range lines {
@@ -138,33 +157,43 @@ func parseMarkdownArtifact(markdown string) (SessionArtifact, error) {
 }
 
 type SessionCloseRequest struct {
-	RepositoryID  string
-	CommitSHA     string
-	Author        string
-	Runtime       string
-	Artifact      []byte
-	Format        ArtifactFormat
-	ManualSummary string
-	Now           time.Time
+	RepositoryID string
+	CommitSHA    string
+	Author       string
+	Runtime      string
+	// RepositoryRoot is the filesystem directory Skill Invocation Artifact
+	// paths are resolved against. It defaults to "." (the process's
+	// current directory) when empty, matching the Repository Installation
+	// convention already used to configure remote storage.
+	RepositoryRoot string
+	Artifact       []byte
+	Format         ArtifactFormat
+	ManualSummary  string
+	Now            time.Time
 }
 
+// SessionDiary's SkillInvocations field is the dedicated, immutable home
+// for reconciled Skill Invocation Records. Their nested Observations are
+// never flattened into the diary's top-level Decisions or Lessons (ADR
+// 0028; issue #26 acceptance criteria).
 type SessionDiary struct {
-	SessionID       string          `json:"session_id"`
-	IdempotencyKey  string          `json:"idempotency_key"`
-	RepositoryID    string          `json:"repository_id"`
-	CommitSHA       string          `json:"commit_sha"`
-	ArtifactHash    string          `json:"artifact_hash"`
-	Author          string          `json:"author"`
-	Runtime         string          `json:"runtime,omitempty"`
-	CreatedAt       time.Time       `json:"created_at"`
-	Title           string          `json:"title"`
-	Summary         string          `json:"summary"`
-	Decisions       []string        `json:"decisions,omitempty"`
-	Lessons         []string        `json:"lessons,omitempty"`
-	CodeReferences  []CodeReference `json:"code_references,omitempty"`
-	Related         []string        `json:"related,omitempty"`
-	GraphSnapshotID string          `json:"graph_snapshot_id,omitempty"`
-	GraphState      string          `json:"graph_state,omitempty"`
+	SessionID        string                  `json:"session_id"`
+	IdempotencyKey   string                  `json:"idempotency_key"`
+	RepositoryID     string                  `json:"repository_id"`
+	CommitSHA        string                  `json:"commit_sha"`
+	ArtifactHash     string                  `json:"artifact_hash"`
+	Author           string                  `json:"author"`
+	Runtime          string                  `json:"runtime,omitempty"`
+	CreatedAt        time.Time               `json:"created_at"`
+	Title            string                  `json:"title"`
+	Summary          string                  `json:"summary"`
+	Decisions        []string                `json:"decisions,omitempty"`
+	Lessons          []string                `json:"lessons,omitempty"`
+	CodeReferences   []CodeReference         `json:"code_references,omitempty"`
+	Related          []string                `json:"related,omitempty"`
+	GraphSnapshotID  string                  `json:"graph_snapshot_id,omitempty"`
+	GraphState       string                  `json:"graph_state,omitempty"`
+	SkillInvocations []SkillInvocationRecord `json:"skill_invocations,omitempty"`
 }
 
 type MemoryPort interface {
@@ -253,32 +282,37 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 	} else if ok {
 		return existing, Delivery{EventID: existing.SessionID}, nil
 	}
+	journal := c.journalForReconciliation()
+	skillInvocations := make([]SkillInvocationRecord, len(a.SkillInvocations))
+	for i, record := range a.SkillInvocations {
+		reconciled, reconcileErr := reconcileSkillInvocationRecord(ctx, journal, record)
+		if reconcileErr != nil {
+			return SessionDiary{}, Delivery{}, reconcileErr
+		}
+		skillInvocations[i] = reconciled
+	}
+	// Runtime artifact evidence is verified against the real filesystem
+	// here, before anything is written to the diary: an unsafe path fails
+	// the close outright, and a safe-but-missing one is recorded as such
+	// without failing it (issue #27).
+	repositoryRoot := strings.TrimSpace(req.RepositoryRoot)
+	if repositoryRoot == "" {
+		repositoryRoot = "."
+	}
+	for i := range skillInvocations {
+		verified, artifactErr := verifyInvocationArtifacts(repositoryRoot, skillInvocations[i].Artifacts)
+		if artifactErr != nil {
+			return SessionDiary{}, Delivery{}, artifactErr
+		}
+		skillInvocations[i].Artifacts = verified
+	}
 	now := req.Now
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
 	now = now.UTC()
-	refs := a.CodeReferences
-	graphState := GraphResolutionPending
-	var graphSnapshotID string
-	if c.Graph != nil {
-		resolution, graphErr := c.Graph.Resolve(ctx, GraphResolveRequest{RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, References: refs})
-		if graphErr != nil {
-			graphState = GraphResolutionPending
-			refs = unresolvedReferences(refs, req.RepositoryID, req.CommitSHA)
-		} else {
-			refs = resolution.References
-			graphSnapshotID = resolution.GraphSnapshotID
-			graphState = GraphReady
-			if publisher, ok := c.Graph.(GraphPublisher); ok {
-				_, publishErr := publisher.Publish(ctx, GraphSnapshot{RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, References: refs})
-				if publishErr != nil {
-					graphState = GraphSyncPending
-				}
-			}
-		}
-	}
-	diary := SessionDiary{SessionID: key[:24], IdempotencyKey: key, RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, ArtifactHash: artifactHash, Author: req.Author, Runtime: req.Runtime, CreatedAt: now, Title: a.Title, Summary: a.Summary, Decisions: a.Decisions, Lessons: a.Lessons, CodeReferences: refs, Related: a.Related, GraphSnapshotID: graphSnapshotID, GraphState: graphState}
+	refs, skillInvocations, graphState, graphSnapshotID := c.resolveCodeReferences(ctx, req, a.CodeReferences, skillInvocations)
+	diary := SessionDiary{SessionID: key[:24], IdempotencyKey: key, RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, ArtifactHash: artifactHash, Author: req.Author, Runtime: req.Runtime, CreatedAt: now, Title: a.Title, Summary: a.Summary, Decisions: a.Decisions, Lessons: a.Lessons, CodeReferences: refs, Related: a.Related, GraphSnapshotID: graphSnapshotID, GraphState: graphState, SkillInvocations: skillInvocations}
 	if err := c.Memory.SaveDiary(ctx, diary); err != nil {
 		return SessionDiary{}, Delivery{}, err
 	}
@@ -290,8 +324,20 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 		return diary, Delivery{EventID: diary.SessionID}, nil
 	}
 	delivery, err := c.Bus.Publish(ctx, e)
-	if err != nil || c.Storage == nil {
+	if err != nil {
 		return diary, delivery, err
+	}
+	// Every accepted invocation record -- journal-verified or
+	// runtime-declared -- gets an immutable skill.invocation-linked event
+	// appended to its own saga, pointing back at this diary without
+	// rewriting any of that saga's prior events (ADR 0028).
+	if journal, ok := c.Bus.journal.(*SagaJournal); ok {
+		if linkErr := emitSkillInvocationLinks(ctx, journal, diary, e.EventID, now); linkErr != nil {
+			return diary, delivery, linkErr
+		}
+	}
+	if c.Storage == nil {
+		return diary, delivery, nil
 	}
 
 	// A durable intent is appended before the first remote effect. A restart
@@ -354,6 +400,147 @@ func (c SessionCloser) Close(ctx context.Context, req SessionCloseRequest) (Sess
 		}
 	}
 	return diary, delivery, err
+}
+
+// journalForReconciliation returns the durable Saga Journal to reconcile
+// Skill Invocation Records against, or nil when none is available. Matching
+// SkillPreparer's rule, a caller without a durable *SagaJournal only gets
+// the effects that are safe without one: every record is treated as
+// runtime-declared rather than rejected for missing evidence it could
+// never have produced.
+func (c SessionCloser) journalForReconciliation() Journal {
+	if c.Bus == nil {
+		return nil
+	}
+	if journal, ok := c.Bus.journal.(*SagaJournal); ok {
+		return journal
+	}
+	return nil
+}
+
+// emitSkillInvocationLinks appends one immutable skill.invocation-linked
+// event per accepted Skill Invocation Record to that invocation's own saga
+// segment. It never touches the diary's own session.closed event or any
+// prior event in the invocation's saga -- it only appends, per ADR 0028's
+// "Skill Invocation owns its saga" rule.
+func emitSkillInvocationLinks(ctx context.Context, journal *SagaJournal, diary SessionDiary, causationEventID string, now time.Time) error {
+	for _, invocation := range diary.SkillInvocations {
+		if invocation.InvocationID == "" {
+			continue
+		}
+		linkPayload, err := json.Marshal(SkillInvocationLinkedPayload{
+			InvocationID: invocation.InvocationID,
+			LinkedFrom:   diary.SessionID,
+		})
+		if err != nil {
+			return fmt.Errorf("encode skill invocation linked payload: %w", err)
+		}
+		linkEvent := Event{
+			EventID:       invocation.InvocationID + ":linked:" + diary.SessionID,
+			Type:          SkillEventInvocationLinked,
+			OccurredAt:    now,
+			RepositoryID:  diary.RepositoryID,
+			SagaID:        invocation.InvocationID,
+			CorrelationID: diary.SessionID,
+			CausationID:   causationEventID,
+			SchemaVersion: SkillEventSchemaVersion,
+			Payload:       linkPayload,
+		}
+		if err := journal.AppendEvent(ctx, linkEvent); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// codeReferenceKey identifies a code reference's declared location for
+// deduplication across a Session Artifact's top-level code references and
+// every Skill Invocation Record's nested code references. Repository,
+// commit, confidence, and graph snapshot identity are always
+// GraphPort-computed, so they never participate in identity.
+type codeReferenceKey struct {
+	Path, Symbol, Kind string
+}
+
+func codeReferenceKeyOf(ref CodeReference) codeReferenceKey {
+	return codeReferenceKey{Path: ref.Path, Symbol: ref.Symbol, Kind: ref.Kind}
+}
+
+// resolveCodeReferences resolves a Session Artifact's top-level code
+// references together with every Skill Invocation Record's nested code
+// references in one deduplicated GraphPort batch, then writes each result
+// back to every location -- top-level and nested -- that declared it
+// (issue #27; ADR 0028). A GraphPort failure preserves every top-level and
+// nested reference, marking each Graph Resolution Pending, rather than
+// dropping any of them.
+func (c SessionCloser) resolveCodeReferences(ctx context.Context, req SessionCloseRequest, topLevel []CodeReference, invocations []SkillInvocationRecord) ([]CodeReference, []SkillInvocationRecord, string, string) {
+	invocations = append([]SkillInvocationRecord(nil), invocations...)
+	if c.Graph == nil {
+		return topLevel, invocations, GraphResolutionPending, ""
+	}
+
+	seen := make(map[codeReferenceKey]struct{})
+	var batch []CodeReference
+	appendUnseen := func(refs []CodeReference) {
+		for _, ref := range refs {
+			key := codeReferenceKeyOf(ref)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			batch = append(batch, ref)
+		}
+	}
+	appendUnseen(topLevel)
+	for _, invocation := range invocations {
+		appendUnseen(invocation.CodeReferences)
+	}
+
+	resolution, graphErr := c.Graph.Resolve(ctx, GraphResolveRequest{RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, References: batch})
+	if graphErr != nil {
+		resolvedTop := unresolvedReferences(topLevel, req.RepositoryID, req.CommitSHA)
+		for i := range invocations {
+			invocations[i].CodeReferences = unresolvedReferences(invocations[i].CodeReferences, req.RepositoryID, req.CommitSHA)
+		}
+		return resolvedTop, invocations, GraphResolutionPending, ""
+	}
+
+	resolvedByKey := make(map[codeReferenceKey]CodeReference, len(resolution.References))
+	for _, resolved := range resolution.References {
+		resolvedByKey[codeReferenceKeyOf(resolved)] = resolved
+	}
+	resolvedTop := applyResolvedReferences(topLevel, resolvedByKey)
+	for i := range invocations {
+		invocations[i].CodeReferences = applyResolvedReferences(invocations[i].CodeReferences, resolvedByKey)
+	}
+
+	graphState, graphSnapshotID := GraphReady, resolution.GraphSnapshotID
+	if publisher, ok := c.Graph.(GraphPublisher); ok {
+		_, publishErr := publisher.Publish(ctx, GraphSnapshot{RepositoryID: req.RepositoryID, CommitSHA: req.CommitSHA, References: resolution.References})
+		if publishErr != nil {
+			graphState = GraphSyncPending
+		}
+	}
+	return resolvedTop, invocations, graphState, graphSnapshotID
+}
+
+// applyResolvedReferences writes each GraphPort-resolved reference back to
+// every position in refs that declared it, leaving any reference GraphPort
+// did not return (it should always return every requested reference)
+// unchanged rather than dropping it.
+func applyResolvedReferences(refs []CodeReference, resolvedByKey map[codeReferenceKey]CodeReference) []CodeReference {
+	if len(refs) == 0 {
+		return refs
+	}
+	out := make([]CodeReference, len(refs))
+	for i, ref := range refs {
+		if resolved, ok := resolvedByKey[codeReferenceKeyOf(ref)]; ok {
+			out[i] = resolved
+			continue
+		}
+		out[i] = ref
+	}
+	return out
 }
 
 func unresolvedReferences(refs []CodeReference, repositoryID, commitSHA string) []CodeReference {
@@ -463,6 +650,26 @@ func RenderSessionDiary(d SessionDiary) string {
 		sections.WriteString("\n## Code References\n")
 		for _, v := range d.CodeReferences {
 			sections.WriteString("- " + v.Path + " | " + v.Symbol + " | " + v.Kind + "\n")
+		}
+	}
+	// Skill Invocation Records get their own dedicated section. Their
+	// nested Observations render indented underneath their own invocation
+	// only -- they are never appended to the Decisions or Lessons
+	// sections above, so a reader can never mistake skill-nested evidence
+	// for top-level memory (ADR 0028; issue #26 acceptance criteria).
+	if len(d.SkillInvocations) > 0 {
+		sections.WriteString("\n## Skill Invocations\n")
+		for _, inv := range d.SkillInvocations {
+			sections.WriteString(fmt.Sprintf("- %s | %s | %s | %s\n", inv.InvocationID, inv.PackageIdentity.QualifiedName(), inv.Outcome, inv.Provenance))
+			if inv.Summary != "" {
+				sections.WriteString("  - Summary: " + inv.Summary + "\n")
+			}
+			for _, decision := range inv.Observations.Decisions {
+				sections.WriteString("  - Decision: " + decision + "\n")
+			}
+			for _, lesson := range inv.Observations.Lessons {
+				sections.WriteString("  - Lesson: " + lesson + "\n")
+			}
 		}
 	}
 	return fmt.Sprintf("---\nsession_id: %s\nidempotency_key: %s\nrepository_id: %s\ncommit_sha: %s\nartifact_hash: %s\nauthor: %s\nruntime: %s\ncreated_at: %s\ntitle: %s\ncode_references: %s\nrelated: %s\n---\n\n<!-- syntroph-metadata\n%s\n-->\n\n# %s\n\n%s", d.SessionID, d.IdempotencyKey, d.RepositoryID, d.CommitSHA, d.ArtifactHash, d.Author, d.Runtime, d.CreatedAt.Format(time.RFC3339Nano), d.Title, refs, strings.Join(related, ","), metadata, d.Title, sections.String())

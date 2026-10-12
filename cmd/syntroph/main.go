@@ -27,7 +27,10 @@ func main() {
 
 func run(args []string, out, errOut interface{ Write([]byte) (int, error) }) error {
 	if len(args) < 2 {
-		return errors.New("usage: syntroph session close | doctor storage | sync <status|recovery|retry|resolve>")
+		return errors.New("usage: syntroph session close | syntroph skill <sync|list|show|verify|prepare|recovery> | doctor storage | sync <status|recovery|retry|resolve>")
+	}
+	if args[0] == "skill" {
+		return runSkill(args[1:], out, errOut)
 	}
 	if args[0] == "session" && args[1] == "close" {
 		return closeSession(args[2:], out, errOut)
@@ -36,7 +39,7 @@ func run(args []string, out, errOut interface{ Write([]byte) (int, error) }) err
 		return doctorStorage(args[2:], out, errOut)
 	}
 	if args[0] != "sync" {
-		return errors.New("usage: syntroph session close | doctor storage | sync <status|recovery|retry|resolve>")
+		return errors.New("usage: syntroph session close | syntroph skill <sync|list|show|verify|prepare|recovery> | doctor storage | sync <status|recovery|retry|resolve>")
 	}
 	journalDir := filepath.Join(".syntroph", "journal")
 	if len(args) >= 3 && strings.HasPrefix(args[1], "--journal=") {
@@ -151,7 +154,7 @@ func closeSession(args []string, out, errOut interface{ Write([]byte) (int, erro
 	}
 	formatValue := core.ArtifactFormat(strings.ToLower(*format))
 	storagePort := configuredStorage(*root, filepath.Dir(*root))
-	diary, delivery, err := (core.SessionCloser{Memory: memory, Bus: bus, Graph: graph, Storage: storagePort}).Close(context.Background(), core.SessionCloseRequest{RepositoryID: *repo, CommitSHA: *sha, Author: *author, Runtime: *runtime, Artifact: data, Format: formatValue, ManualSummary: *summary})
+	diary, delivery, err := (core.SessionCloser{Memory: memory, Bus: bus, Graph: graph, Storage: storagePort}).Close(context.Background(), core.SessionCloseRequest{RepositoryID: *repo, CommitSHA: *sha, Author: *author, Runtime: *runtime, RepositoryRoot: filepath.Dir(*root), Artifact: data, Format: formatValue, ManualSummary: *summary})
 	if err != nil {
 		return err
 	}
